@@ -1,0 +1,544 @@
+#!/usr/bin/env bash
+#
+# provision.sh — monta um alvo propositalmente vulnerável para aulas de
+# segurança (nível iniciante), num Debian LIMPO, escolhendo o que instalar
+# por um MENU.
+#
+# ┌──────────────────────────────────────────────────────────────────────┐
+# │  ISTO DEIXA A MÁQUINA GRAVEMENTE INSEGURA DE PROPÓSITO.                 │
+# │  Use SÓ numa VM descartável, isolada da rede/internet.                 │
+# │  No Qubes: StandaloneVM, sem netvm (ou rede isolada). Nunca no dom0.   │
+# └──────────────────────────────────────────────────────────────────────┘
+#
+# Uso:
+#   sudo ./provision.sh                 # abre o MENU de seleção
+#   sudo ./provision.sh --all           # instala tudo (sem menu)
+#   sudo ./provision.sh --only dns,web  # instala só esses módulos
+#   sudo ./provision.sh --list          # lista os módulos disponíveis
+#   sudo ./provision.sh --all --yes     # tudo, sem pedir confirmação
+#
+set -euo pipefail
+
+# ------------------------------------------------------------------ helpers --
+if [ -t 1 ]; then
+  R='\033[0;31m'; G='\033[0;32m'; Y='\033[0;33m'; B='\033[1m'; X='\033[0m'
+else R=''; G=''; Y=''; B=''; X=''; fi
+log()  { printf '%b[+]%b %s\n' "$G" "$X" "$*"; }
+info() { printf '%b[*]%b %s\n' "$B" "$X" "$*"; }
+warn() { printf '%b[!]%b %s\n' "$Y" "$X" "$*" >&2; }
+die()  { printf '%b[x]%b %s\n' "$R" "$X" "$*" >&2; exit 1; }
+
+set_kv() { # arquivo chave valor -> define/substitui (idempotente)
+  local f="$1" k="$2" v="$3"; touch "$f"
+  if grep -qE "^\s*#?\s*${k}\b" "$f"; then
+    sed -i -E "s|^\s*#?\s*${k}\b.*|${k} ${v}|" "$f"
+  else printf '%s %s\n' "$k" "$v" >> "$f"; fi
+}
+add_user() { local u="$1" p="$2" s="${3:-/bin/bash}"
+  id "$u" >/dev/null 2>&1 || useradd -m -s "$s" "$u"; echo "${u}:${p}" | chpasswd; }
+svc() { local s="$1"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable "$s" >/dev/null 2>&1 || true
+    systemctl restart "$s" >/dev/null 2>&1 || warn "não subiu $s — reinicie a VM"
+  elif command -v service >/dev/null 2>&1; then
+    service "$s" restart >/dev/null 2>&1 || warn "não subiu $s — reinicie a VM"
+  else warn "sem systemd — reinicie a VM para subir $s"; fi
+}
+APT_DONE=0
+apt_install() {
+  if [ "$APT_DONE" = 0 ]; then
+    info "apt-get update..."; DEBIAN_FRONTEND=noninteractive apt-get update -qq || true
+    APT_DONE=1
+  fi
+  info "instalando: $*"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" || die "falha ao instalar: $*"
+}
+
+# ---------------------------------------------------------- registro de módulos
+MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis privesc)
+declare -A TITLE
+TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
+TITLE[ssh]="SSH com senha fraca / login de root"
+TITLE[ftp]="FTP anônimo com upload (vsftpd) + creds vazadas"
+TITLE[samba]="Samba/NetBIOS aberto a convidado (enum4linux)"
+TITLE[dns]="DNS com transferência de zona liberada (AXFR)"
+TITLE[web]="App web: SQLi, XSS, LFI, upload/RCE, cmd injection"
+TITLE[apache]="Apache mal configurado (server-status, userdir, listing, .htpasswd)"
+TITLE[nginx]="nginx com path traversal (alias) e .git exposto (:8080)"
+TITLE[nfs]="NFS com no_root_squash + RPC/rpcbind (rpcinfo/showmount)"
+TITLE[smtp]="SMTP open relay (Postfix) + VRFY para enumeração"
+TITLE[redis]="Redis sem senha, exposto na rede (RCE)"
+TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
+
+usage() {
+  echo "Uso: sudo ./provision.sh [--all | --only m1,m2,...] [--yes] [--list]"
+  echo "Módulos:"; for m in "${MODS[@]}"; do printf "  %-9s %s\n" "$m" "${TITLE[$m]}"; done
+}
+
+# --------------------------------------------------------------- args + seleção
+declare -A SEL; for m in "${MODS[@]}"; do SEL[$m]=0; done
+INTERACTIVE=1; ASSUME_YES=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --all)  INTERACTIVE=0; for m in "${MODS[@]}"; do SEL[$m]=1; done;;
+    --only) INTERACTIVE=0; IFS=, read -ra P <<<"${2:-}"; shift
+            for p in "${P[@]}"; do
+              [ -n "${TITLE[$p]:-}" ] || die "módulo desconhecido: '$p' (veja --list)"
+              SEL[$p]=1
+            done;;
+    --yes)  ASSUME_YES=1;;
+    --list) usage; exit 0;;
+    -h|--help) usage; exit 0;;
+    *) die "opção desconhecida: '$1' (veja --help)";;
+  esac; shift
+done
+
+# ------------------------------------------------------------------- guardas --
+[ "$(id -u)" -eq 0 ] || die "rode como root:  sudo ./provision.sh"
+command -v apt-get >/dev/null 2>&1 || die "feito para Debian/Ubuntu (apt-get ausente)"
+case "$(hostname 2>/dev/null)" in *prod*|*production*) die "hostname parece produção — abortando";; esac
+
+# menu interativo (marca todos por padrão; número alterna)
+if [ "$INTERACTIVE" = 1 ]; then
+  for m in "${MODS[@]}"; do SEL[$m]=1; done
+  while :; do
+    clear 2>/dev/null || true
+    echo; echo "  Selecione o que instalar no laboratório:"; echo
+    i=1; for m in "${MODS[@]}"; do
+      mark=' '; [ "${SEL[$m]}" = 1 ] && mark='x'
+      printf "   %2d) [%s] %-9s %s\n" "$i" "$mark" "$m" "${TITLE[$m]}"; i=$((i+1))
+    done
+    echo
+    echo "   a) marcar todos    n) desmarcar todos    ENTER) confirmar    q) sair"
+    read -r -p "  > " ans || ans=""
+    case "$ans" in
+      "") break;;
+      a) for m in "${MODS[@]}"; do SEL[$m]=1; done;;
+      n) for m in "${MODS[@]}"; do SEL[$m]=0; done;;
+      q) die "cancelado";;
+      *[!0-9\ ]*) warn "entrada inválida"; sleep 1;;
+      *) for n in $ans; do idx=$((n-1)); m="${MODS[$idx]:-}"
+           [ -n "$m" ] && SEL[$m]=$(( 1 - SEL[$m] )); done;;
+    esac
+  done
+fi
+
+# dependências: ssh/ftp/privesc precisam dos usuários do módulo base
+if [ "${SEL[ssh]}" = 1 ] || [ "${SEL[ftp]}" = 1 ] || [ "${SEL[privesc]}" = 1 ]; then
+  SEL[base]=1
+fi
+
+# nada selecionado?
+CHOSEN=(); for m in "${MODS[@]}"; do [ "${SEL[$m]}" = 1 ] && CHOSEN+=("$m"); done
+[ "${#CHOSEN[@]}" -gt 0 ] || die "nenhum módulo selecionado — nada a fazer"
+
+# confirmação
+if [ "$ASSUME_YES" != 1 ]; then
+  echo; warn "Vai instalar vulnerabilidades: ${CHOSEN[*]}"
+  warn "NÃO rode numa máquina que te importa ou conectada à internet."
+  read -r -p "  Digite 'sim' para continuar: " ok || ok=""
+  [ "$ok" = "sim" ] || die "cancelado"
+fi
+
+# --------------------------------------------------------------------- flags --
+rnd() { head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+FLAG_WEB="FLAG{web_sqli_$(rnd)}"
+FLAG_USER="FLAG{foothold_$(rnd)}"
+FLAG_ROOT="FLAG{root_$(rnd)}"
+FLAG_DNS="FLAG{dns_axfr_$(rnd)}"
+FLAG_NGINX="FLAG{nginx_traversal_$(rnd)}"
+FLAG_NFS="FLAG{nfs_norootsquash_$(rnd)}"
+FLAG_REDIS="FLAG{redis_noauth_$(rnd)}"
+FLAG_APACHE="FLAG{apache_misconf_$(rnd)}"
+
+# gabarito (só para o instrutor)
+
+log "Provisionando: ${CHOSEN[*]}"
+
+# ============================================================ MÓDULOS
+mod_base() {
+  info "== base: usuários e credenciais fracas =="
+  add_user msfadmin msfadmin
+  add_user aluno    aluno
+  add_user servico  servico123
+  echo "root:toor" | chpasswd
+  printf '%s\n' "$FLAG_USER" > /home/aluno/user.txt
+  chown aluno:aluno /home/aluno/user.txt; chmod 0644 /home/aluno/user.txt
+  mkdir -p /var/backups
+  printf '# senhas antigas de um backup\nmsfadmin:msfadmin\naluno:aluno\n' \
+    > /var/backups/credenciais.old; chmod 0644 /var/backups/credenciais.old
+}
+
+mod_ssh() {
+  info "== ssh: autenticação fraca =="
+  apt_install openssh-server
+  set_kv /etc/ssh/sshd_config PasswordAuthentication yes
+  set_kv /etc/ssh/sshd_config PermitRootLogin yes
+  set_kv /etc/ssh/sshd_config PermitEmptyPasswords no
+  svc ssh
+}
+
+mod_ftp() {
+  info "== ftp: vsftpd anônimo com upload =="
+  apt_install vsftpd
+  cat > /etc/vsftpd.conf <<'EOF'
+listen=YES
+listen_ipv6=NO
+anonymous_enable=YES
+local_enable=YES
+write_enable=YES
+anon_upload_enable=YES
+anon_mkdir_write_enable=YES
+anon_root=/srv/ftp
+pam_service_name=vsftpd
+seccomp_sandbox=NO
+ftpd_banner=Bem-vindo ao FTP interno (vsftpd 2.3.4)
+EOF
+  mkdir -p /srv/ftp/pub
+  cat > /srv/ftp/pub/leia-me.txt <<'EOF'
+Backup do servidor. Lembrete pro time:
+  banco:   webapp / webapp123
+  servico: servico / servico123
+APAGAR ISTO DEPOIS.
+EOF
+  chown -R ftp:ftp /srv/ftp/pub; chmod 555 /srv/ftp; chmod 777 /srv/ftp/pub
+  svc vsftpd
+}
+
+mod_samba() {
+  info "== samba: NetBIOS + compartilhamento guest =="
+  apt_install samba
+  # NetBIOS + enumeração anônima habilitados (enum4linux/nmblookup)
+  if ! grep -q '^\[publico\]' /etc/samba/smb.conf; then
+    sed -i '/^\[global\]/a\   netbios name = FILESERVER\n   server string = Servidor de Arquivos\n   map to guest = Bad User\n   guest account = nobody\n   restrict anonymous = 0' /etc/samba/smb.conf
+    cat >> /etc/samba/smb.conf <<'EOF'
+
+[publico]
+   comment = Publico (guest)
+   path = /srv/samba/publico
+   browseable = yes
+   read only = no
+   guest ok = yes
+   guest only = yes
+   force user = nobody
+
+[privado]
+   comment = Setor administrativo
+   path = /srv/samba/privado
+   browseable = yes
+   read only = no
+   valid users = msfadmin
+EOF
+  fi
+  mkdir -p /srv/samba/publico /srv/samba/privado
+  echo "Dica: a app web esta na porta 80; o FTP na 21." > /srv/samba/publico/notas.txt
+  echo "Credenciais do banco: webapp / webapp123" > /srv/samba/privado/segredo.txt
+  chmod -R 0777 /srv/samba/publico
+  chmod -R 0770 /srv/samba/privado
+  # define a senha samba de msfadmin (se o usuário existir)
+  if id msfadmin >/dev/null 2>&1; then
+    (echo 'msfadmin'; echo 'msfadmin') | smbpasswd -s -a msfadmin >/dev/null 2>&1 || true
+  fi
+  svc smbd; svc nmbd
+}
+
+mod_apache() {
+  info "== apache: configuração de servidor insegura =="
+  apt_install apache2 apache2-utils
+  a2enmod status userdir >/dev/null 2>&1 || true
+  # server-status exposto a qualquer um (info disclosure)
+  cat > /etc/apache2/conf-available/lab-status.conf <<'EOF'
+ExtendedStatus On
+<Location /server-status>
+    SetHandler server-status
+    Require all granted
+</Location>
+<Location /server-info>
+    SetHandler server-info
+    Require all granted
+</Location>
+EOF
+  a2enmod info >/dev/null 2>&1 || true
+  a2enconf lab-status >/dev/null 2>&1 || true
+  # userdir (/~aluno/) apontando pro home do aluno, se existir
+  if id aluno >/dev/null 2>&1; then
+    mkdir -p /home/aluno/public_html
+    printf '%s\n' "$FLAG_APACHE" > /home/aluno/public_html/flag.txt
+    echo "<h1>pagina do aluno</h1>" > /home/aluno/public_html/index.html
+    chmod 711 /home/aluno; chmod -R 755 /home/aluno/public_html
+  fi
+  # diretório com listagem + .htpasswd exposto (hash pra crackear)
+  mkdir -p /var/www/html/arquivos
+  echo "relatorio financeiro interno" > /var/www/html/arquivos/relatorio.txt
+  local HTP; HTP="$(openssl passwd -apr1 admin123 2>/dev/null || echo '$apr1$saltsalt$0000000000000000000000')"
+  printf 'admin:%s\n' "$HTP" > /var/www/html/arquivos/.htpasswd
+  cat > /etc/apache2/conf-available/lab-arquivos.conf <<'EOF'
+<Directory /var/www/html/arquivos>
+    Options +Indexes
+    Require all granted
+    AllowOverride None
+</Directory>
+<Files ".htpasswd">
+    Require all granted
+</Files>
+EOF
+  a2enconf lab-arquivos >/dev/null 2>&1 || true
+  svc apache2
+}
+
+mod_nginx() {
+  info "== nginx: path traversal por alias + .git exposto (:8080) =="
+  apt_install nginx
+  rm -f /etc/nginx/sites-enabled/default    # evita conflito na porta 80 com o apache
+  mkdir -p /var/www/nginx/site /var/www/nginx/downloads /var/www/nginx/secret
+  echo "<h1>Site publico</h1>" > /var/www/nginx/site/index.html
+  echo "manual.pdf, catalogo.pdf ..." > /var/www/nginx/downloads/publico.txt
+  printf '%s\n' "$FLAG_NGINX" > /var/www/nginx/secret/flag.txt
+  # repo git "esquecido" servido publicamente (source/secret disclosure)
+  mkdir -p /var/www/nginx/site/.git
+  echo "ref: refs/heads/master" > /var/www/nginx/site/.git/HEAD
+  echo "[remote \"origin\"] url = http://webapp:webapp123@interno/repo.git" \
+    > /var/www/nginx/site/.git/config
+  cat > /etc/nginx/sites-available/lab <<'EOF'
+server {
+    listen 8080 default_server;
+    root /var/www/nginx/site;
+    autoindex on;                      # listagem de diretório habilitada
+
+
+    location /downloads {
+        alias /var/www/nginx/downloads/;
+    }
+    # .git NÃO é bloqueado -> exposição de código-fonte/segredos
+}
+EOF
+  ln -sf ../sites-available/lab /etc/nginx/sites-enabled/lab
+  nginx -t >/dev/null 2>&1 || warn "nginx -t reclamou da config"
+  svc nginx
+}
+
+mod_nfs() {
+  info "== nfs: export com no_root_squash (+ RPC/rpcbind) =="
+  apt_install nfs-kernel-server rpcbind
+  mkdir -p /srv/nfs/publico
+  printf '%s\n' "$FLAG_NFS" > /srv/nfs/publico/flag.txt
+  chmod -R 0777 /srv/nfs
+  echo '/srv/nfs *(rw,sync,no_root_squash,no_subtree_check,insecure)' > /etc/exports
+  modprobe nfsd 2>/dev/null || true          # garante o módulo do kernel
+  svc rpcbind                                 # rpcbind PRIMEIRO (nfs depende dele)
+  svc nfs-kernel-server
+  exportfs -ra 2>/dev/null || true            # exporta depois do servidor no ar
+}
+
+mod_smtp() {
+  info "== smtp: Postfix open relay + VRFY =="
+  echo "postfix postfix/main_mailer_type select Internet Site" | debconf-set-selections
+  echo "postfix postfix/mailname string empresa.local" | debconf-set-selections
+  apt_install postfix
+  postconf -e 'inet_interfaces = all'
+  postconf -e 'inet_protocols = ipv4'
+  postconf -e 'mynetworks = 0.0.0.0/0'
+  postconf -e 'smtpd_recipient_restrictions = permit'
+  postconf -e 'smtpd_helo_required = no'
+  postconf -e 'disable_vrfy_command = no'
+  svc postfix
+}
+
+mod_redis() {
+  info "== redis: sem senha, exposto na rede =="
+  apt_install redis-server
+  local RC=/etc/redis/redis.conf
+  sed -i 's/^bind .*/bind 0.0.0.0 ::/' "$RC" 2>/dev/null || true
+  sed -i 's/^protected-mode .*/protected-mode no/' "$RC" 2>/dev/null || true
+  grep -q '^protected-mode' "$RC" 2>/dev/null || echo 'protected-mode no' >> "$RC"
+  # sem requirepass -> sem autenticação
+  sed -i 's/^\s*requirepass /# requirepass /' "$RC" 2>/dev/null || true
+  svc redis-server; sleep 1
+  redis-cli set flag "$FLAG_REDIS" >/dev/null 2>&1 || true
+  redis-cli set nota "servidor de cache interno" >/dev/null 2>&1 || true
+}
+
+mod_dns() {
+  info "== dns: BIND9 com transferência de zona (AXFR) liberada =="
+  apt_install bind9 bind9utils
+  cat > /etc/bind/named.conf.local <<'EOF'
+zone "empresa.local" {
+    type master;
+    file "/etc/bind/db.empresa.local";
+    allow-transfer { any; };
+};
+EOF
+  cat > /etc/bind/db.empresa.local <<EOF
+\$TTL 604800
+@   IN  SOA ns1.empresa.local. admin.empresa.local. (
+        2024010101 604800 86400 2419200 604800 )
+@       IN  NS      ns1.empresa.local.
+@       IN  MX  10  mail.empresa.local.
+ns1     IN  A       127.0.0.1
+www     IN  A       127.0.0.1
+mail    IN  A       10.0.0.3
+intranet IN A       10.0.0.5
+vpn     IN  A       10.0.0.6
+backup  IN  A       10.0.0.7
+admin   IN  A       10.0.0.8
+dev     IN  CNAME   www.empresa.local.
+_secret IN  TXT     "${FLAG_DNS}"
+EOF
+  # valida antes de subir
+  named-checkconf 2>/dev/null || warn "named-checkconf reclamou (verifique /etc/bind)"
+  named-checkzone empresa.local /etc/bind/db.empresa.local >/dev/null 2>&1 \
+    || warn "named-checkzone reclamou da zona"
+  if systemctl list-unit-files 2>/dev/null | grep -q '^named'; then svc named; else svc bind9; fi
+}
+
+mod_web() {
+  info "== web: Apache + PHP + MariaDB vulnerável =="
+  apt_install apache2 php libapache2-mod-php php-mysql mariadb-server
+  local W=/var/www/html
+  rm -f "$W/index.html"; mkdir -p "$W/uploads"
+
+  cat > "$W/config.php" <<'EOF'
+<?php
+define('DB_HOST','127.0.0.1'); define('DB_USER','webapp');
+define('DB_PASS','webapp123'); define('DB_NAME','webapp');
+EOF
+  cp "$W/config.php" "$W/config.php.bak"
+
+  cat > "$W/index.php" <<'EOF'
+<!doctype html><meta charset="utf-8"><title>Portal Interno</title>
+<h1>Portal Interno</h1>
+<!-- TODO: remover /config.php.bak antes de subir pra producao -->
+<ul>
+ <li><a href="login.php">Login (área restrita)</a></li>
+ <li><a href="busca.php">Buscar funcionário</a></li>
+ <li><a href="pagina.php?arquivo=home.html">Sobre</a></li>
+ <li><a href="upload.php">Enviar currículo</a></li>
+ <li><a href="ping.php">Ferramenta de rede (ping)</a></li>
+</ul>
+EOF
+  echo "<h2>Sobre</h2><p>Empresa fictícia de laboratório.</p>" > "$W/home.html"
+
+  cat > "$W/login.php" <<'EOF'
+<?php require 'config.php';
+$c=new mysqli(DB_HOST,DB_USER,DB_PASS,DB_NAME); $msg='';
+if($_SERVER['REQUEST_METHOD']==='POST'){
+  $u=$_POST['usuario']??''; $p=$_POST['senha']??'';
+
+  $q="SELECT usuario,secret FROM usuarios WHERE usuario='$u' AND senha='$p'";
+  $r=$c->query($q);
+  if($r && $row=$r->fetch_assoc()) $msg="Bem-vindo ".htmlspecialchars($row['usuario'])."! Flag: ".$row['secret'];
+  else $msg="Credenciais inválidas.";
+}?>
+<!doctype html><meta charset="utf-8"><title>Login</title><h1>Área restrita</h1>
+<form method="post">Usuário:<input name="usuario"> Senha:<input name="senha" type="password">
+<button>Entrar</button></form><p><b><?php echo $msg;?></b></p><a href="index.php">voltar</a>
+EOF
+
+  cat > "$W/busca.php" <<'EOF'
+<?php $q=$_GET['q']??'';?>
+<!doctype html><meta charset="utf-8"><title>Busca</title><h1>Buscar</h1>
+<form><input name="q"><button>Buscar</button></form>
+<p>Você buscou por: <?php echo $q;?></p><a href="index.php">voltar</a>
+EOF
+
+  cat > "$W/pagina.php" <<'EOF'
+<?php $a=$_GET['arquivo']??'home.html'; include($a);?>
+<hr><a href="index.php">voltar</a>
+EOF
+
+  cat > "$W/upload.php" <<'EOF'
+<?php $msg='';
+if(!empty($_FILES['arquivo']['name'])){
+
+  $d='uploads/'.basename($_FILES['arquivo']['name']);
+  $msg=move_uploaded_file($_FILES['arquivo']['tmp_name'],$d)?"Enviado: <a href=\"$d\">$d</a>":"Falhou.";
+}?>
+<!doctype html><meta charset="utf-8"><title>Upload</title><h1>Enviar currículo</h1>
+<form method="post" enctype="multipart/form-data"><input type="file" name="arquivo">
+<button>Enviar</button></form><p><?php echo $msg;?></p><a href="index.php">voltar</a>
+EOF
+
+  cat > "$W/ping.php" <<'EOF'
+<?php $o=''; $ip=$_GET['ip']??'';
+if($ip!=='') $o=shell_exec('ping -c 2 '.$ip.' 2>&1');
+<!doctype html><meta charset="utf-8"><title>Ping</title><h1>Rede</h1>
+<form><input name="ip" placeholder="127.0.0.1"><button>Ping</button></form>
+<pre><?php echo htmlspecialchars($o??'');?></pre><a href="index.php">voltar</a>
+EOF
+
+  printf 'User-agent: *\nDisallow: /config.php.bak\nDisallow: /uploads/\n' > "$W/robots.txt"
+  echo '<?php phpinfo();' > "$W/phpinfo.php"
+
+  cat > /etc/apache2/conf-available/lab.conf <<EOF
+<Directory ${W}/uploads>
+    Options +Indexes
+    Require all granted
+</Directory>
+EOF
+  a2enconf lab >/dev/null 2>&1 || true
+  chown -R www-data:www-data "$W"; chmod -R 0755 "$W"
+  chmod 0777 "$W/uploads"; chmod 0644 "$W/config.php.bak"
+
+  svc mariadb; sleep 2
+  mysql <<EOF
+CREATE DATABASE IF NOT EXISTS webapp;
+CREATE USER IF NOT EXISTS 'webapp'@'127.0.0.1' IDENTIFIED BY 'webapp123';
+CREATE USER IF NOT EXISTS 'webapp'@'localhost' IDENTIFIED BY 'webapp123';
+GRANT ALL ON webapp.* TO 'webapp'@'127.0.0.1';
+GRANT ALL ON webapp.* TO 'webapp'@'localhost'; FLUSH PRIVILEGES;
+USE webapp;
+CREATE TABLE IF NOT EXISTS usuarios(id INT AUTO_INCREMENT PRIMARY KEY,
+  usuario VARCHAR(50), senha VARCHAR(50), secret VARCHAR(120));
+DELETE FROM usuarios;
+INSERT INTO usuarios(usuario,senha,secret) VALUES
+ ('admin','S3nh4F0rt3!2024','${FLAG_WEB}'),
+ ('joao','joao123','sem flag'),('maria','maria2023','sem flag');
+EOF
+  svc apache2
+}
+
+mod_privesc() {
+  info "== privesc: SUID, sudo, cron =="
+  chmod u+s /usr/bin/find
+  echo 'aluno ALL=(ALL) NOPASSWD: /usr/bin/vim' > /etc/sudoers.d/lab-aluno
+  chmod 0440 /etc/sudoers.d/lab-aluno
+  cat > /opt/backup.sh <<'EOF'
+#!/bin/bash
+/usr/bin/find /var/log -name '*.log' -mtime +30 -delete 2>/dev/null
+EOF
+  chmod 0777 /opt/backup.sh
+  echo '* * * * * root /opt/backup.sh' > /etc/cron.d/lab-backup
+  chmod 0644 /etc/cron.d/lab-backup
+  svc cron
+  printf '%s\n' "$FLAG_ROOT" > /root/root.txt; chmod 0600 /root/root.txt
+}
+
+# executa na ordem
+for m in "${MODS[@]}"; do
+  [ "${SEL[$m]}" = 1 ] && "mod_$m"
+done
+
+# --------------------------------------------------------------------- resumo
+IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+declare -A PORT
+PORT[ftp]="21/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"
+PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
+PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
+declare -A SEEN; SVCS=""
+for m in "${MODS[@]}"; do
+  p="${PORT[$m]:-}"
+  [ "${SEL[$m]}" = 1 ] && [ -n "$p" ] && [ -z "${SEEN[$p]:-}" ] && { SVCS+=" $p"; SEEN[$p]=1; }
+done
+
+cat <<EOF
+
+$(printf '%b' "$G")============================================================$(printf '%b' "$X")
+ Laboratório pronto!   IP: ${IP:-<veja: ip a>}
+ Módulos: ${CHOSEN[*]}
+ Portas:${SVCS:-  (nenhum serviço de rede)}
+$(printf '%b' "$G")============================================================$(printf '%b' "$X")
+
+ Mantenha a VM ISOLADA da internet. Reset entre turmas: snapshot.
+
+EOF
+log "Pronto."

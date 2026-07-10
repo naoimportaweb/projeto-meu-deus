@@ -1,0 +1,34 @@
+====================================================================
+ LAB meudeus — 3 scripts. O NOME do script diz pra qual VM ele vai.
+====================================================================
+
+  sysnet.sh        -> mande pra  sys-net       -> rode:  sudo bash sysnet.sh
+  exploitable.sh   -> mande pra  exploitable   -> rode:  sudo bash exploitable.sh
+  kali.sh          -> mande pra  kali          -> rode:  bash kali.sh
+
+ORDEM:  1) sysnet.sh   2) exploitable.sh   3) kali.sh
+
+O QUE CADA UM FAZ
+  sysnet.sh       libera kali<->alvo, da Internet ao alvo, bloqueia sua LAN
+                  real e outros qubes, e persiste. (a contencao mora aqui)
+  exploitable.sh  faz o alvo aceitar entrada so da kali, persiste, e prova
+                  a protecao (kali=ok, internet=ok, LAN=fail).
+  kali.sh         confirma que a kali alcanca o alvo (ping/curl/test-lab).
+
+POLITICA
+  O alvo TEM Internet (apt/provision funcionam direto), mas NAO alcanca a
+  sua LAN real (192.168.x / 10.x / 172.16.x) nem os outros qubes.
+
+IPs PADRAO (edite o topo do script se os seus diferirem, ou passe por env):
+  kali=10.137.0.21   exploitable=10.137.0.24   roteador=192.168.100.1
+
+COMO LEVAR PRA CADA VM
+  qvm-copy /tmp/sysnet.sh          (e idem exploitable.sh, kali.sh)
+  ou de uma vez:  qvm-copy /tmp/lab-scripts.tgz  ->  tar xzf lab-scripts.tgz
+  Chegam em ~/QubesIncoming/<origem>/ na VM destino.
+
+PERSISTENCIA (ja feita pelos scripts)
+  sys-net -> /rw/config/qubes-firewall-user-script
+  alvo    -> /rw/config/rc.local
+  Prova real = reiniciar as duas VMs e rodar de novo sysnet.sh (mostra as
+  regras) / exploitable.sh (mostra kali=ok internet=ok lan=fail) / kali.sh.
