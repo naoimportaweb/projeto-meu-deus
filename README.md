@@ -4,8 +4,10 @@ Monta um ambiente lotado de erros e falhas de segurança — um alvo
 propositalmente vulnerável, nível **iniciante**, para aulas de pentest.
 É um **único script** (`provision.sh`) que transforma um Debian limpo no alvo.
 
-> ⚠️ **Isto deixa a máquina gravemente insegura de propósito.** Rode apenas
-> numa VM descartável e **isolada da internet**.
+> ⚠️ **Isto deixa a máquina gravemente insegura de propósito.** Rode apenas numa
+> **VM descartável**. Ela precisa de Internet para provisionar (o `curl` e o `apt`);
+> **logo depois, contenha-a** para que não alcance a sua rede local — receita em
+> [`REDE-E-ISOLACAO.md`](REDE-E-ISOLACAO.md).
 
 ## Instalação rápida (curl)
 
@@ -22,7 +24,11 @@ curl -fsSL https://raw.githubusercontent.com/naoimportaweb/projeto-meu-deus/refs
 ```
 
 O modo `curl | bash` exige `--all --yes`: o menu interativo precisa do arquivo em
-disco (o `read` disputa o stdin com o pipe). Depois de baixar, isole a VM da rede.
+disco (o `read` disputa o stdin com o pipe).
+
+**Ordem certa:** provisione **com Internet** (o `curl` e o `apt` precisam dela) e
+**só então** contenha o alvo, bloqueando o acesso à sua LAN — receita em
+[`REDE-E-ISOLACAO.md`](REDE-E-ISOLACAO.md) (scripts em `qubes/`).
 
 ## Como usar
 
