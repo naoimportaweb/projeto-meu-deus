@@ -722,7 +722,7 @@ SQL
   mkdir -p "$W"; chown -R www-data:www-data "$W"
   local IPADDR; IPADDR="$(hostname -I 2>/dev/null | awk '{print $1}')"
   local WPC="sudo -u www-data wp --path=$W"
-  $WPC core download 2>/dev/null || { warn "wordpress: core download falhou — abortado"; return; }
+  $WPC core download --force 2>/dev/null || { warn "wordpress: core download falhou — abortado"; return; }
   $WPC config create --dbname=wordpress --dbuser=wpuser --dbpass=wppass --dbhost=127.0.0.1 --force 2>/dev/null
   $WPC config set WP_DEBUG true --raw 2>/dev/null || true
   $WPC config set WP_DEBUG_LOG true --raw 2>/dev/null || true
