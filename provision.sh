@@ -460,7 +460,7 @@ EOF
 
   cat > "$W/ping.php" <<'EOF'
 <?php $o=''; $ip=$_GET['ip']??'';
-if($ip!=='') $o=shell_exec('ping -c 2 '.$ip.' 2>&1');
+if($ip!=='') $o=shell_exec('ping -c 2 '.$ip.' 2>&1'); ?>
 <!doctype html><meta charset="utf-8"><title>Ping</title><h1>Rede</h1>
 <form><input name="ip" placeholder="127.0.0.1"><button>Ping</button></form>
 <pre><?php echo htmlspecialchars($o??'');?></pre><a href="index.php">voltar</a>
