@@ -55,7 +55,7 @@ apt_install() {
 }
 
 # ---------------------------------------------------------- registro de módulos
-MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat privesc)
+MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress jenkins phpmyadmin privesc)
 declare -A TITLE
 TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
 TITLE[ssh]="SSH com senha fraca / login de root"
@@ -73,6 +73,9 @@ TITLE[snmp]="SNMP com community public/private (enumeracao/recon)"
 TITLE[mysql]="MariaDB exposto na rede + privilegio FILE (LOAD_FILE/OUTFILE)"
 TITLE[postgres]="PostgreSQL exposto + superuser fraco (COPY FROM PROGRAM = RCE)"
 TITLE[tomcat]="Tomcat manager com credenciais fracas (deploy WAR = RCE)"
+TITLE[wordpress]="WordPress com admin fraco + user enum (via wp-cli)"
+TITLE[jenkins]="Jenkins com script console sem auth (RCE) — PESADO"
+TITLE[phpmyadmin]="phpMyAdmin exposto (usa as creds do mysql)"
 TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
 
 usage() {
@@ -161,6 +164,8 @@ FLAG_SNMP="FLAG{snmp_$(rnd)}"
 FLAG_MYSQL="FLAG{mysql_$(rnd)}"
 FLAG_PG="FLAG{pg_$(rnd)}"
 FLAG_TOMCAT="FLAG{tomcat_$(rnd)}"
+FLAG_WP="FLAG{wordpress_$(rnd)}"
+FLAG_JENKINS="FLAG{jenkins_$(rnd)}"
 
 # gabarito (só para o instrutor)
 
@@ -696,6 +701,74 @@ XML
   svc tomcat10
 }
 
+mod_wordpress() {
+  info "== wordpress: CMS com admin fraco (via wp-cli) =="
+  apt_install apache2 php libapache2-mod-php php-mysql mariadb-server curl php-xml php-curl php-gd php-mbstring
+  local W=/var/www/html/wordpress
+  if [ ! -x /usr/local/bin/wp ]; then
+    curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp \
+      || { warn "wordpress: falha baixando wp-cli — abortado"; return; }
+    chmod +x /usr/local/bin/wp
+  fi
+  svc mariadb; sleep 2
+  mysql <<SQL
+CREATE DATABASE IF NOT EXISTS wordpress;
+CREATE USER IF NOT EXISTS 'wpuser'@'localhost' IDENTIFIED BY 'wppass';
+GRANT ALL ON wordpress.* TO 'wpuser'@'localhost'; FLUSH PRIVILEGES;
+SQL
+  mkdir -p "$W"; chown -R www-data:www-data "$W"
+  local IPADDR; IPADDR="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  sudo -u www-data wp --path="$W" core download 2>/dev/null || { warn "wordpress: core download falhou — abortado"; return; }
+  sudo -u www-data wp --path="$W" config create --dbname=wordpress --dbuser=wpuser --dbpass=wppass --dbhost=127.0.0.1 --force 2>/dev/null
+  sudo -u www-data wp --path="$W" core install --url="http://${IPADDR:-localhost}/wordpress" --title="Empresa Blog" --admin_user=admin --admin_password=admin --admin_email=admin@empresa.local --skip-email 2>/dev/null || warn "wordpress: core install reclamou"
+  sudo -u www-data wp --path="$W" user create editor editor@empresa.local --role=editor --user_pass=editor 2>/dev/null || true
+  sudo -u www-data wp --path="$W" post create --post_status=private --post_title="Segredo interno" --post_content="${FLAG_WP}" 2>/dev/null || true
+  svc apache2
+}
+
+mod_jenkins() {
+  info "== jenkins: script console sem auth (RCE) — PESADO =="
+  apt_install curl gnupg default-jre-headless
+  if [ ! -f /usr/lib/systemd/system/jenkins.service ] && ! command -v jenkins >/dev/null 2>&1; then
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key -o /usr/share/keyrings/jenkins.asc \
+      || { warn "jenkins: falha na chave — abortado"; return; }
+    echo "deb [signed-by=/usr/share/keyrings/jenkins.asc] https://pkg.jenkins.io/debian-stable binary/" > /etc/apt/sources.list.d/jenkins.list
+    APT_DONE=0; apt_install jenkins || { warn "jenkins: install falhou — abortado"; return; }
+  fi
+  # porta 8083, pula o setup wizard e desliga a seguranca (script console aberto)
+  mkdir -p /etc/systemd/system/jenkins.service.d
+  cat > /etc/systemd/system/jenkins.service.d/lab.conf <<EOF
+[Service]
+Environment="JENKINS_PORT=8083"
+Environment="JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Dhudson.security.csrf.GlobalCrumbIssuerConfiguration.DISABLE_CSRF_PROTECTION=true"
+EOF
+  local JH=/var/lib/jenkins
+  mkdir -p "$JH"
+  cat > "$JH/config.xml" <<'XML'
+<?xml version='1.1' encoding='UTF-8'?>
+<hudson>
+  <version>2.0</version>
+  <useSecurity>false</useSecurity>
+  <authorizationStrategy class="hudson.security.AuthorizationStrategy$Unsecured"/>
+  <securityRealm class="hudson.security.SecurityRealm$None"/>
+</hudson>
+XML
+  printf '%s\n' "$FLAG_JENKINS" > "$JH/flag.txt"
+  chown -R jenkins:jenkins "$JH" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  svc jenkins
+}
+
+mod_phpmyadmin() {
+  info "== phpmyadmin: painel exposto (usa creds do mysql) =="
+  apt_install apache2 php mariadb-server
+  echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2" | debconf-set-selections
+  echo "phpmyadmin phpmyadmin/dbconfig-install boolean false" | debconf-set-selections
+  DEBIAN_FRONTEND=noninteractive apt_install phpmyadmin || { warn "phpmyadmin: install falhou — abortado"; return; }
+  a2enconf phpmyadmin >/dev/null 2>&1 || true
+  svc apache2
+}
+
 # executa na ordem
 for m in "${MODS[@]}"; do
   [ "${SEL[$m]}" = 1 ] && "mod_$m"
@@ -709,6 +782,7 @@ PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
 PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
 PORT[log4j]="8888/http"
 PORT[snmp]="161/udp-snmp"; PORT[mysql]="3306/mysql"; PORT[postgres]="5432/postgresql"; PORT[tomcat]="8082/http"
+PORT[wordpress]="80/http"; PORT[jenkins]="8083/http"; PORT[phpmyadmin]="80/http"
 declare -A SEEN; SVCS=""
 for m in "${MODS[@]}"; do
   p="${PORT[$m]:-}"
