@@ -55,7 +55,7 @@ apt_install() {
 }
 
 # ---------------------------------------------------------- registro de módulos
-MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j privesc)
+MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat privesc)
 declare -A TITLE
 TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
 TITLE[ssh]="SSH com senha fraca / login de root"
@@ -69,6 +69,10 @@ TITLE[nfs]="NFS com no_root_squash + RPC/rpcbind (rpcinfo/showmount)"
 TITLE[smtp]="SMTP open relay (Postfix) + VRFY para enumeração"
 TITLE[redis]="Redis sem senha, exposto na rede (RCE)"
 TITLE[log4j]="App Java vulneravel ao Log4Shell CVE-2021-44228 (PESADO: baixa JDK 8)"
+TITLE[snmp]="SNMP com community public/private (enumeracao/recon)"
+TITLE[mysql]="MariaDB exposto na rede + privilegio FILE (LOAD_FILE/OUTFILE)"
+TITLE[postgres]="PostgreSQL exposto + superuser fraco (COPY FROM PROGRAM = RCE)"
+TITLE[tomcat]="Tomcat manager com credenciais fracas (deploy WAR = RCE)"
 TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
 
 usage() {
@@ -153,6 +157,10 @@ FLAG_REDIS="FLAG{redis_noauth_$(rnd)}"
 FLAG_APACHE="FLAG{apache_misconf_$(rnd)}"
 FLAG_SMB="FLAG{smb_rpc_$(rnd)}"
 FLAG_LOG4J="FLAG{log4shell_$(rnd)}"
+FLAG_SNMP="FLAG{snmp_$(rnd)}"
+FLAG_MYSQL="FLAG{mysql_$(rnd)}"
+FLAG_PG="FLAG{pg_$(rnd)}"
+FLAG_TOMCAT="FLAG{tomcat_$(rnd)}"
 
 # gabarito (só para o instrutor)
 
@@ -610,6 +618,84 @@ EOF
   svc log4j-lab
 }
 
+mod_snmp() {
+  info "== snmp: snmpd com community publica (enumeracao/recon) =="
+  apt_install snmpd snmp
+  cat > /etc/snmp/snmpd.conf <<EOF
+agentAddress udp:161
+rocommunity public
+rwcommunity private
+sysLocation Sala de servidores - ${FLAG_SNMP}
+sysContact admin@empresa.local
+extend whoami /usr/bin/id
+EOF
+  svc snmpd
+}
+
+mod_mysql() {
+  info "== mysql: MariaDB exposto na rede + privilegio FILE =="
+  apt_install mariadb-server
+  local CNF; CNF="$(ls /etc/mysql/mariadb.conf.d/*server.cnf 2>/dev/null | head -1)"
+  if [ -n "$CNF" ]; then
+    sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' "$CNF"
+    grep -q '^secure_file_priv' "$CNF" || sed -i '/^\[mysqld\]/a secure_file_priv = ""' "$CNF"
+  fi
+  svc mariadb; sleep 2
+  mysql <<SQL
+CREATE DATABASE IF NOT EXISTS corp;
+CREATE USER IF NOT EXISTS 'dbadmin'@'%' IDENTIFIED BY 'admin123';
+GRANT ALL PRIVILEGES ON *.* TO 'dbadmin'@'%' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+USE corp;
+CREATE TABLE IF NOT EXISTS segredos(id INT, chave VARCHAR(120));
+DELETE FROM segredos;
+INSERT INTO segredos VALUES (1, '${FLAG_MYSQL}');
+SQL
+}
+
+mod_postgres() {
+  info "== postgres: exposto + superuser fraco (COPY FROM PROGRAM = RCE) =="
+  apt_install postgresql
+  local PGDIR; PGDIR="$(ls -d /etc/postgresql/*/main 2>/dev/null | head -1)"
+  [ -n "$PGDIR" ] || { warn "postgres: config nao encontrada — abortado"; return; }
+  sed -i "s/^#\?listen_addresses.*/listen_addresses = '*'/" "$PGDIR/postgresql.conf"
+  grep -q '0.0.0.0/0 md5' "$PGDIR/pg_hba.conf" || echo "host all all 0.0.0.0/0 md5" >> "$PGDIR/pg_hba.conf"
+  svc postgresql; sleep 2
+  sudo -u postgres psql -v ON_ERROR_STOP=0 <<PGSQL
+ALTER USER postgres WITH PASSWORD 'postgres';
+DROP DATABASE IF EXISTS corp;
+CREATE DATABASE corp;
+\connect corp
+CREATE TABLE segredos(id int, chave text);
+INSERT INTO segredos VALUES (1, '${FLAG_PG}');
+PGSQL
+  svc postgresql
+}
+
+mod_tomcat() {
+  info "== tomcat: manager com creds fracas (deploy WAR = RCE) =="
+  apt_install tomcat10 tomcat10-admin
+  sed -i 's/port="8080"/port="8082"/' /etc/tomcat10/server.xml 2>/dev/null || true
+  cat > /etc/tomcat10/tomcat-users.xml <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<tomcat-users xmlns="http://tomcat.apache.org/xml">
+  <role rolename="manager-gui"/>
+  <role rolename="manager-script"/>
+  <user username="tomcat" password="tomcat" roles="manager-gui,manager-script"/>
+</tomcat-users>
+XML
+  # libera o Manager p/ acesso remoto (remove o RemoteAddrValve que so aceita localhost)
+  for c in /usr/share/tomcat10-admin/manager/META-INF/context.xml \
+           /etc/tomcat10/Catalina/localhost/manager.xml; do
+    [ -f "$c" ] && cat > "$c" <<'XML'
+<Context antiResourceLocking="false" privileged="true" />
+XML
+  done
+  mkdir -p /var/lib/tomcat10/webapps/ROOT
+  printf '%s\n' "$FLAG_TOMCAT" > /var/lib/tomcat10/webapps/ROOT/flag.txt 2>/dev/null || true
+  svc tomcat10
+}
+
 # executa na ordem
 for m in "${MODS[@]}"; do
   [ "${SEL[$m]}" = 1 ] && "mod_$m"
@@ -622,6 +708,7 @@ PORT[ftp]="21/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"
 PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
 PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
 PORT[log4j]="8888/http"
+PORT[snmp]="161/udp-snmp"; PORT[mysql]="3306/mysql"; PORT[postgres]="5432/postgresql"; PORT[tomcat]="8082/http"
 declare -A SEEN; SVCS=""
 for m in "${MODS[@]}"; do
   p="${PORT[$m]:-}"
