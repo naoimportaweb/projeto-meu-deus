@@ -7,6 +7,23 @@ propositalmente vulnerável, nível **iniciante**, para aulas de pentest.
 > ⚠️ **Isto deixa a máquina gravemente insegura de propósito.** Rode apenas
 > numa VM descartável e **isolada da internet**.
 
+## Instalação rápida (curl)
+
+Na VM-alvo (Debian limpo, com Internet):
+
+```bash
+# baixar e rodar com o MENU de seleção
+curl -fsSL https://raw.githubusercontent.com/naoimportaweb/projeto-meu-deus/refs/heads/main/provision.sh -o provision.sh
+chmod +x provision.sh
+sudo ./provision.sh
+
+# ou tudo de uma vez, sem menu:
+curl -fsSL https://raw.githubusercontent.com/naoimportaweb/projeto-meu-deus/refs/heads/main/provision.sh | sudo bash -s -- --all --yes
+```
+
+O modo `curl | bash` exige `--all --yes`: o menu interativo precisa do arquivo em
+disco (o `read` disputa o stdin com o pipe). Depois de baixar, isole a VM da rede.
+
 ## Como usar
 
 1. Crie uma VM Debian limpa (Debian 12/13).
