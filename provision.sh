@@ -53,9 +53,14 @@ apt_install() {
   info "instalando: $*"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" || die "falha ao instalar: $*"
 }
+# variante NAO-fatal (p/ modulos que podem falhar sem abortar o resto)
+apt_try() {
+  info "instalando (best-effort): $*"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
+}
 
 # ---------------------------------------------------------- registro de módulos
-MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress jenkins phpmyadmin privesc)
+MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress phpmyadmin privesc)
 declare -A TITLE
 TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
 TITLE[ssh]="SSH com senha fraca / login de root"
@@ -74,7 +79,6 @@ TITLE[mysql]="MariaDB exposto na rede + privilegio FILE (LOAD_FILE/OUTFILE)"
 TITLE[postgres]="PostgreSQL exposto + superuser fraco (COPY FROM PROGRAM = RCE)"
 TITLE[tomcat]="Tomcat manager com credenciais fracas (deploy WAR = RCE)"
 TITLE[wordpress]="WordPress com admin fraco + user enum (via wp-cli)"
-TITLE[jenkins]="Jenkins com script console sem auth (RCE) — PESADO"
 TITLE[phpmyadmin]="phpMyAdmin exposto (usa as creds do mysql)"
 TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
 
@@ -165,7 +169,6 @@ FLAG_MYSQL="FLAG{mysql_$(rnd)}"
 FLAG_PG="FLAG{pg_$(rnd)}"
 FLAG_TOMCAT="FLAG{tomcat_$(rnd)}"
 FLAG_WP="FLAG{wordpress_$(rnd)}"
-FLAG_JENKINS="FLAG{jenkins_$(rnd)}"
 
 # gabarito (só para o instrutor)
 
@@ -729,9 +732,20 @@ SQL
   $WPC user create john   john@empresa.local   --role=author --user_pass=password  2>/dev/null || true
   $WPC post create --post_status=private --post_title="Segredo interno" --post_content="${FLAG_WP}" 2>/dev/null || true
   # plugins VULNERAVEIS (versoes fixas do repo WP)
-  $WPC plugin install wp-file-manager --version=6.0   --activate 2>/dev/null || warn "wordpress: wp-file-manager 6.0 nao instalou"
-  $WPC plugin install mail-masta      --version=1.0   --activate 2>/dev/null || warn "wordpress: mail-masta 1.0 nao instalou"
-  $WPC plugin install reflex-gallery  --version=3.1.3 --activate 2>/dev/null || warn "wordpress: reflex-gallery nao instalou"
+  # plugins vulneraveis: arquivo-direto (a vuln nao precisa do wp-cli/ativacao, que
+  # barram por compat com WP/PHP novos). mail-masta LFI e' plantado (reproduzivel);
+  # wp-file-manager (RCE) e' baixado best-effort.
+  mkdir -p "$W/wp-content/plugins/mail-masta/inc/campaign"
+  cat > "$W/wp-content/plugins/mail-masta/inc/campaign/count_of_send.php" <<'PHP'
+<?php
+// Mail Masta 1.0 — CVE-2016-10956 (LFI). Arquivo vulneravel do plugin, reproduzido p/ o lab.
+include($_GET['pl']);
+PHP
+  if curl -fsSL "https://downloads.wordpress.org/plugin/wp-file-manager.6.0.zip" -o /tmp/wpp.zip 2>/dev/null; then
+    unzip -oq /tmp/wpp.zip -d "$W/wp-content/plugins" 2>/dev/null || warn "wordpress: wp-file-manager unzip falhou"
+    rm -f /tmp/wpp.zip
+  else warn "wordpress: wp-file-manager download falhou"; fi
+  chown -R www-data:www-data "$W/wp-content/plugins"
   # flag lida via RCE (www-data), fora do docroot
   mkdir -p /var/www/private
   printf '%s\n' "$FLAG_WP" > /var/www/private/flag.txt
@@ -750,45 +764,12 @@ EOF
   svc apache2
 }
 
-mod_jenkins() {
-  info "== jenkins: script console sem auth (RCE) — PESADO =="
-  apt_install curl gnupg default-jre-headless
-  if [ ! -f /usr/lib/systemd/system/jenkins.service ] && ! command -v jenkins >/dev/null 2>&1; then
-    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key -o /usr/share/keyrings/jenkins.asc \
-      || { warn "jenkins: falha na chave — abortado"; return; }
-    echo "deb [signed-by=/usr/share/keyrings/jenkins.asc] https://pkg.jenkins.io/debian-stable binary/" > /etc/apt/sources.list.d/jenkins.list
-    APT_DONE=0; apt_install jenkins || { warn "jenkins: install falhou — abortado"; return; }
-  fi
-  # porta 8083, pula o setup wizard e desliga a seguranca (script console aberto)
-  mkdir -p /etc/systemd/system/jenkins.service.d
-  cat > /etc/systemd/system/jenkins.service.d/lab.conf <<EOF
-[Service]
-Environment="JENKINS_PORT=8083"
-Environment="JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Dhudson.security.csrf.GlobalCrumbIssuerConfiguration.DISABLE_CSRF_PROTECTION=true"
-EOF
-  local JH=/var/lib/jenkins
-  mkdir -p "$JH"
-  cat > "$JH/config.xml" <<'XML'
-<?xml version='1.1' encoding='UTF-8'?>
-<hudson>
-  <version>2.0</version>
-  <useSecurity>false</useSecurity>
-  <authorizationStrategy class="hudson.security.AuthorizationStrategy$Unsecured"/>
-  <securityRealm class="hudson.security.SecurityRealm$None"/>
-</hudson>
-XML
-  printf '%s\n' "$FLAG_JENKINS" > "$JH/flag.txt"
-  chown -R jenkins:jenkins "$JH" 2>/dev/null || true
-  systemctl daemon-reload 2>/dev/null || true
-  svc jenkins
-}
-
 mod_phpmyadmin() {
   info "== phpmyadmin: painel exposto (usa creds do mysql) =="
   apt_install apache2 php mariadb-server
   echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2" | debconf-set-selections
   echo "phpmyadmin phpmyadmin/dbconfig-install boolean false" | debconf-set-selections
-  DEBIAN_FRONTEND=noninteractive apt_install phpmyadmin || { warn "phpmyadmin: install falhou — abortado"; return; }
+  apt_try phpmyadmin || { warn "phpmyadmin: install falhou - modulo pulado, resto segue"; return; }
   a2enconf phpmyadmin >/dev/null 2>&1 || true
   svc apache2
 }
@@ -806,7 +787,7 @@ PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
 PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
 PORT[log4j]="8888/http"
 PORT[snmp]="161/udp-snmp"; PORT[mysql]="3306/mysql"; PORT[postgres]="5432/postgresql"; PORT[tomcat]="8082/http"
-PORT[wordpress]="80/http"; PORT[jenkins]="8083/http"; PORT[phpmyadmin]="80/http"
+PORT[wordpress]="80/http"; PORT[phpmyadmin]="80/http"
 declare -A SEEN; SVCS=""
 for m in "${MODS[@]}"; do
   p="${PORT[$m]:-}"
