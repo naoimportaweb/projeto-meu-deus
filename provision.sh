@@ -702,8 +702,8 @@ XML
 }
 
 mod_wordpress() {
-  info "== wordpress: CMS com admin fraco (via wp-cli) =="
-  apt_install apache2 php libapache2-mod-php php-mysql mariadb-server curl php-xml php-curl php-gd php-mbstring
+  info "== wordpress: bateria de vulns (core + plugins CVE + config) =="
+  apt_install apache2 php libapache2-mod-php php-mysql mariadb-server curl unzip php-xml php-curl php-gd php-mbstring php-zip
   local W=/var/www/html/wordpress
   if [ ! -x /usr/local/bin/wp ]; then
     curl -fsSL https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -o /usr/local/bin/wp \
@@ -718,11 +718,35 @@ GRANT ALL ON wordpress.* TO 'wpuser'@'localhost'; FLUSH PRIVILEGES;
 SQL
   mkdir -p "$W"; chown -R www-data:www-data "$W"
   local IPADDR; IPADDR="$(hostname -I 2>/dev/null | awk '{print $1}')"
-  sudo -u www-data wp --path="$W" core download 2>/dev/null || { warn "wordpress: core download falhou — abortado"; return; }
-  sudo -u www-data wp --path="$W" config create --dbname=wordpress --dbuser=wpuser --dbpass=wppass --dbhost=127.0.0.1 --force 2>/dev/null
-  sudo -u www-data wp --path="$W" core install --url="http://${IPADDR:-localhost}/wordpress" --title="Empresa Blog" --admin_user=admin --admin_password=admin --admin_email=admin@empresa.local --skip-email 2>/dev/null || warn "wordpress: core install reclamou"
-  sudo -u www-data wp --path="$W" user create editor editor@empresa.local --role=editor --user_pass=editor 2>/dev/null || true
-  sudo -u www-data wp --path="$W" post create --post_status=private --post_title="Segredo interno" --post_content="${FLAG_WP}" 2>/dev/null || true
+  local WPC="sudo -u www-data wp --path=$W"
+  $WPC core download 2>/dev/null || { warn "wordpress: core download falhou — abortado"; return; }
+  $WPC config create --dbname=wordpress --dbuser=wpuser --dbpass=wppass --dbhost=127.0.0.1 --force 2>/dev/null
+  $WPC config set WP_DEBUG true --raw 2>/dev/null || true
+  $WPC config set WP_DEBUG_LOG true --raw 2>/dev/null || true
+  $WPC core install --url="http://${IPADDR:-localhost}/wordpress" --title="Empresa Blog" --admin_user=admin --admin_password=admin --admin_email=admin@empresa.local --skip-email 2>/dev/null || warn "wordpress: core install reclamou"
+  # usuarios fracos (user enum + brute)
+  $WPC user create editor editor@empresa.local --role=editor --user_pass=editor123 2>/dev/null || true
+  $WPC user create john   john@empresa.local   --role=author --user_pass=password  2>/dev/null || true
+  $WPC post create --post_status=private --post_title="Segredo interno" --post_content="${FLAG_WP}" 2>/dev/null || true
+  # plugins VULNERAVEIS (versoes fixas do repo WP)
+  $WPC plugin install wp-file-manager --version=6.0   --activate 2>/dev/null || warn "wordpress: wp-file-manager 6.0 nao instalou"
+  $WPC plugin install mail-masta      --version=1.0   --activate 2>/dev/null || warn "wordpress: mail-masta 1.0 nao instalou"
+  $WPC plugin install reflex-gallery  --version=3.1.3 --activate 2>/dev/null || warn "wordpress: reflex-gallery nao instalou"
+  # flag lida via RCE (www-data), fora do docroot
+  mkdir -p /var/www/private
+  printf '%s\n' "$FLAG_WP" > /var/www/private/flag.txt
+  chown www-data:www-data /var/www/private/flag.txt; chmod 0600 /var/www/private/flag.txt
+  # exposicoes de config
+  cp "$W/wp-config.php" "$W/wp-config.php.bak" 2>/dev/null || true
+  chmod 0644 "$W/wp-config.php.bak" 2>/dev/null || true
+  cat > /etc/apache2/conf-available/wp-listing.conf <<EOF
+<Directory ${W}/wp-content/uploads>
+  Options +Indexes
+  Require all granted
+</Directory>
+EOF
+  a2enconf wp-listing >/dev/null 2>&1 || true
+  chown -R www-data:www-data "$W"
   svc apache2
 }
 
