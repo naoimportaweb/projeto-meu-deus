@@ -294,6 +294,17 @@ mod_nginx() {
   echo "<h1>Site publico</h1>" > /var/www/nginx/site/index.html
   echo "manual.pdf, catalogo.pdf ..." > /var/www/nginx/downloads/publico.txt
   printf '%s\n' "$FLAG_NGINX" > /var/www/nginx/secret/flag.txt
+  # config interno "esquecido" FORA da pasta servida -> alvo do path traversal
+  mkdir -p /var/www/nginx/private
+  cat > /var/www/nginx/private/db.conf <<'CONF'
+# configuracao interna — NAO servir publicamente
+DB_HOST=127.0.0.1
+DB_NAME=intranet
+DB_USER=svc_intranet
+DB_PASS=Intr@net#2024
+API_TOKEN=sk_live_4f3c9a7e21b8
+CONF
+  chmod 0644 /var/www/nginx/private/db.conf
   # repo git "esquecido" servido publicamente (source/secret disclosure)
   mkdir -p /var/www/nginx/site/.git
   echo "ref: refs/heads/master" > /var/www/nginx/site/.git/HEAD
