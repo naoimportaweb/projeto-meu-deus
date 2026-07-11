@@ -150,6 +150,7 @@ FLAG_NGINX="FLAG{nginx_traversal_$(rnd)}"
 FLAG_NFS="FLAG{nfs_norootsquash_$(rnd)}"
 FLAG_REDIS="FLAG{redis_noauth_$(rnd)}"
 FLAG_APACHE="FLAG{apache_misconf_$(rnd)}"
+FLAG_SMB="FLAG{smb_rpc_$(rnd)}"
 
 # gabarito (só para o instrutor)
 
@@ -228,6 +229,12 @@ mod_samba() {
    browseable = yes
    read only = no
    valid users = msfadmin
+
+[backup]
+   comment = Backups (restrito)
+   path = /srv/samba/backup
+   valid users = backupsvc
+   read only = yes
 EOF
   fi
   mkdir -p /srv/samba/publico /srv/samba/privado
@@ -239,6 +246,13 @@ EOF
   if id msfadmin >/dev/null 2>&1; then
     (echo 'msfadmin'; echo 'msfadmin') | smbpasswd -s -a msfadmin >/dev/null 2>&1 || true
   fi
+  # usuario de servico p/ enumeracao RPC/SAMR (null session) + share [backup] com flag
+  add_user backupsvc backup123
+  (echo 'backup123'; echo 'backup123') | smbpasswd -s -a backupsvc >/dev/null 2>&1 || true
+  mkdir -p /srv/samba/backup
+  printf '%s\n' "$FLAG_SMB" > /srv/samba/backup/flag.txt
+  chown backupsvc:backupsvc /srv/samba/backup/flag.txt 2>/dev/null || true
+  chmod 0640 /srv/samba/backup/flag.txt
   svc smbd; svc nmbd
 }
 
