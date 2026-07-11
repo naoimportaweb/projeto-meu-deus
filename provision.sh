@@ -55,7 +55,7 @@ apt_install() {
 }
 
 # ---------------------------------------------------------- registro de módulos
-MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis privesc)
+MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j privesc)
 declare -A TITLE
 TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
 TITLE[ssh]="SSH com senha fraca / login de root"
@@ -68,6 +68,7 @@ TITLE[nginx]="nginx com path traversal (alias) e .git exposto (:8080)"
 TITLE[nfs]="NFS com no_root_squash + RPC/rpcbind (rpcinfo/showmount)"
 TITLE[smtp]="SMTP open relay (Postfix) + VRFY para enumeração"
 TITLE[redis]="Redis sem senha, exposto na rede (RCE)"
+TITLE[log4j]="App Java vulneravel ao Log4Shell CVE-2021-44228 (PESADO: baixa JDK 8)"
 TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
 
 usage() {
@@ -151,6 +152,7 @@ FLAG_NFS="FLAG{nfs_norootsquash_$(rnd)}"
 FLAG_REDIS="FLAG{redis_noauth_$(rnd)}"
 FLAG_APACHE="FLAG{apache_misconf_$(rnd)}"
 FLAG_SMB="FLAG{smb_rpc_$(rnd)}"
+FLAG_LOG4J="FLAG{log4shell_$(rnd)}"
 
 # gabarito (só para o instrutor)
 
@@ -538,6 +540,76 @@ EOF
   printf '%s\n' "$FLAG_ROOT" > /root/root.txt; chmod 0600 /root/root.txt
 }
 
+mod_log4j() {
+  info "== log4j: app Java vulneravel ao Log4Shell (CVE-2021-44228) =="
+  local D=/opt/log4j JDK=/opt/jdk8
+  local LC=log4j-core-2.14.1.jar LA=log4j-api-2.14.1.jar
+  local BASE=https://repo1.maven.org/maven2/org/apache/logging/log4j
+  apt_install curl ca-certificates
+  mkdir -p "$D"
+  if [ ! -x "$JDK/bin/java" ]; then
+    info "baixando JDK 8 (Temurin) — pesado, aguarde..."
+    curl -fsSL "https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse" -o /tmp/jdk8.tgz \
+      || { warn "falha ao baixar JDK 8 — modulo log4j abortado"; return; }
+    mkdir -p "$JDK"; tar xzf /tmp/jdk8.tgz -C "$JDK" --strip-components=1 \
+      || { warn "falha ao extrair JDK 8 — abortado"; return; }
+  fi
+  curl -fsSL "$BASE/log4j-core/2.14.1/$LC" -o "$D/$LC" || { warn "falha baixando log4j-core"; return; }
+  curl -fsSL "$BASE/log4j-api/2.14.1/$LA"  -o "$D/$LA" || { warn "falha baixando log4j-api"; return; }
+  cat > "$D/App.java" <<'JAVA'
+import com.sun.net.httpserver.*;
+import java.io.*;
+import java.net.InetSocketAddress;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+public class App {
+  static final Logger log = LogManager.getLogger("app");
+  public static void main(String[] args) throws Exception {
+    HttpServer s = HttpServer.create(new InetSocketAddress(8888), 0);
+    s.createContext("/", new HttpHandler() {
+      public void handle(HttpExchange ex) throws IOException {
+        String v = ex.getRequestHeaders().getFirst("X-Api-Version");
+        if (v == null) v = ex.getRequestHeaders().getFirst("User-Agent");
+        log.info("request X-Api-Version=" + v);   // Log4Shell: loga input do usuario
+        byte[] b = "Portal de Servicos v1.0\n".getBytes();
+        ex.sendResponseHeaders(200, b.length);
+        OutputStream o = ex.getResponseBody(); o.write(b); o.close();
+      }
+    });
+    s.setExecutor(null); s.start();
+    System.out.println("log4j lab up on :8888");
+  }
+}
+JAVA
+  cat > "$D/log4j2.xml" <<'XML'
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN">
+ <Appenders><Console name="C" target="SYSTEM_OUT"/></Appenders>
+ <Loggers><Root level="info"><AppenderRef ref="C"/></Root></Loggers>
+</Configuration>
+XML
+  "$JDK/bin/javac" -cp "$D/$LC:$D/$LA" -d "$D" "$D/App.java" \
+    || { warn "falha ao compilar o app log4j"; return; }
+  add_user log4jsvc log4jsvc
+  printf '%s\n' "$FLAG_LOG4J" > "$D/flag.txt"
+  chown -R log4jsvc:log4jsvc "$D"; chmod 0600 "$D/flag.txt"
+  cat > /etc/systemd/system/log4j-lab.service <<EOF
+[Unit]
+Description=Lab Log4Shell (CVE-2021-44228)
+After=network.target
+[Service]
+User=log4jsvc
+Environment=LAB_FLAG=$FLAG_LOG4J
+WorkingDirectory=$D
+ExecStart=$JDK/bin/java -Dcom.sun.jndi.ldap.object.trustURLCodebase=true -cp $D:$D/$LC:$D/$LA App
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc log4j-lab
+}
+
 # executa na ordem
 for m in "${MODS[@]}"; do
   [ "${SEL[$m]}" = 1 ] && "mod_$m"
@@ -549,6 +621,7 @@ declare -A PORT
 PORT[ftp]="21/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"
 PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
 PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
+PORT[log4j]="8888/http"
 declare -A SEEN; SVCS=""
 for m in "${MODS[@]}"; do
   p="${PORT[$m]:-}"
