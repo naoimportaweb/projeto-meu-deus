@@ -60,11 +60,13 @@ apt_try() {
 }
 
 # ---------------------------------------------------------- registro de módulos
-MODS=(base ssh ftp samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress phpmyadmin privesc)
+MODS=(base ssh ftp vsftpd234 ftpdos samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress phpmyadmin privesc)
 declare -A TITLE
 TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
 TITLE[ssh]="SSH com senha fraca / login de root"
-TITLE[ftp]="FTP anônimo com upload (vsftpd) + creds vazadas"
+TITLE[ftp]="FTP anônimo com upload (vsftpd, porta 2121) + creds vazadas"
+TITLE[vsftpd234]="Backdoor vsftpd 2.3.4 na porta 21 (CVE-2011-2523) -> shell root"
+TITLE[ftpdos]="FTP legado 2.3.2 na porta 2100: DoS por glob (CVE-2011-0762)"
 TITLE[samba]="Samba/NetBIOS aberto a convidado (enum4linux)"
 TITLE[dns]="DNS com transferência de zona liberada (AXFR)"
 TITLE[web]="App web: SQLi, XSS, LFI, upload/RCE, cmd injection"
@@ -169,6 +171,7 @@ FLAG_MYSQL="FLAG{mysql_$(rnd)}"
 FLAG_PG="FLAG{pg_$(rnd)}"
 FLAG_TOMCAT="FLAG{tomcat_$(rnd)}"
 FLAG_WP="FLAG{wordpress_$(rnd)}"
+FLAG_FTPBD="FLAG{ftp_vsftpd234_backdoor_$(rnd)}"
 
 # gabarito (só para o instrutor)
 
@@ -198,11 +201,12 @@ mod_ssh() {
 }
 
 mod_ftp() {
-  info "== ftp: vsftpd anônimo com upload =="
+  info "== ftp: vsftpd anônimo com upload (porta 2121) =="
   apt_install vsftpd
   cat > /etc/vsftpd.conf <<'EOF'
 listen=YES
 listen_ipv6=NO
+listen_port=2121
 anonymous_enable=YES
 local_enable=YES
 write_enable=YES
@@ -211,7 +215,7 @@ anon_mkdir_write_enable=YES
 anon_root=/srv/ftp
 pam_service_name=vsftpd
 seccomp_sandbox=NO
-ftpd_banner=Bem-vindo ao FTP interno (vsftpd 2.3.4)
+ftpd_banner=Bem-vindo ao FTP interno (vsftpd)
 EOF
   mkdir -p /srv/ftp/pub
   cat > /srv/ftp/pub/leia-me.txt <<'EOF'
@@ -222,6 +226,101 @@ APAGAR ISTO DEPOIS.
 EOF
   chown -R ftp:ftp /srv/ftp/pub; chmod 555 /srv/ftp; chmod 777 /srv/ftp/pub
   svc vsftpd
+}
+
+mod_vsftpd234() {
+  info "== vsftpd234: vsftpd 2.3.4 na porta 21 (CVE-2011-2523) =="
+  apt_install socat
+  printf '%s\n' "$FLAG_FTPBD" > /root/flag_ftp_backdoor.txt; chmod 0600 /root/flag_ftp_backdoor.txt
+  cat > /usr/local/sbin/vsftpd234.sh <<'EOF'
+#!/bin/bash
+BD=6200
+printf '220 (vsFTPd 2.3.4)\r\n'
+trig=0
+while IFS= read -r line; do
+  line="${line%$'\r'}"
+  verb="${line%% *}"; verb="${verb^^}"
+  case "$verb" in
+    USER)
+      case "$line" in *':)'*) trig=1;; esac
+      printf '331 Please specify the password.\r\n' ;;
+    PASS)
+      if [ "$trig" = 1 ]; then
+        if ! ss -ltn 2>/dev/null | grep -q ":$BD[[:space:]]"; then
+          setsid socat TCP-LISTEN:$BD,reuseaddr,fork EXEC:'/bin/bash -i',pty,stderr,setsid,sigint,sane >/dev/null 2>&1 &
+        fi
+        sleep 2; exit 0
+      fi
+      printf '230 Login successful.\r\n' ;;
+    SYST) printf '215 UNIX Type: L8\r\n' ;;
+    QUIT) printf '221 Goodbye.\r\n'; exit 0 ;;
+    "")   : ;;
+    *)    printf '530 Please login with USER and PASS.\r\n' ;;
+  esac
+done
+EOF
+  chmod 0755 /usr/local/sbin/vsftpd234.sh
+  cat > /etc/systemd/system/vsftpd234.service <<'EOF'
+[Unit]
+Description=Lab vsftpd 2.3.4 backdoor (CVE-2011-2523)
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat -T120 TCP-LISTEN:21,reuseaddr,fork EXEC:/usr/local/sbin/vsftpd234.sh,pty,raw,echo=0
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc vsftpd234
+}
+
+mod_ftpdos() {
+  info "== ftpdos: vsftpd 2.3.2 na porta 2100 (CVE-2011-0762) =="
+  apt_install socat
+  cat > /usr/local/sbin/ftpdos.sh <<'EOF'
+#!/bin/bash
+N=4000
+T=120
+burn() {
+  local i
+  for ((i=0;i<N;i++)); do timeout "$T" sleep "$T" & done
+  for i in 1 2 3 4; do timeout "$T" bash -c 'while :; do :; done' & done
+}
+crafted() { case "$1" in *'{'*|*'['*|*'*'*'*'*'*'*) return 0;; *) return 1;; esac; }
+printf '220 (vsFTPd 2.3.2)\r\n'
+while IFS= read -r line; do
+  line="${line%$'\r'}"
+  verb="${line%% *}"; verb="${verb^^}"; arg="${line#* }"; [ "$arg" = "$line" ] && arg=""
+  case "$verb" in
+    USER) printf '331 Please specify the password.\r\n' ;;
+    PASS) printf '230 Login successful.\r\n' ;;
+    SYST) printf '215 UNIX Type: L8\r\n' ;;
+    TYPE) printf '200 Switching to Binary mode.\r\n' ;;
+    PWD)  printf '257 "/"\r\n' ;;
+    LIST|NLST|STAT)
+      printf '150 Here comes the directory listing.\r\n'
+      if crafted "$arg"; then burn >/dev/null 2>&1
+      else printf 'drwxr-xr-x 2 ftp ftp 4096 pub\r\n'; fi
+      printf '226 Directory send OK.\r\n' ;;
+    QUIT) printf '221 Goodbye.\r\n'; exit 0 ;;
+    "")   : ;;
+    *)    printf '530 Please login with USER and PASS.\r\n' ;;
+  esac
+done
+EOF
+  chmod 0755 /usr/local/sbin/ftpdos.sh
+  cat > /etc/systemd/system/ftpdos.service <<'EOF'
+[Unit]
+Description=Lab FTP legado vulneravel a DoS por glob (CVE-2011-0762)
+After=network.target
+[Service]
+ExecStart=/usr/bin/socat -T120 TCP-LISTEN:2100,reuseaddr,fork EXEC:/usr/local/sbin/ftpdos.sh,pty,raw,echo=0
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc ftpdos
 }
 
 mod_samba() {
@@ -782,7 +881,7 @@ done
 # --------------------------------------------------------------------- resumo
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 declare -A PORT
-PORT[ftp]="21/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"
+PORT[ftp]="2121/ftp"; PORT[vsftpd234]="21/ftp,6200/shell"; PORT[ftpdos]="2100/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"
 PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
 PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
 PORT[log4j]="8888/http"
