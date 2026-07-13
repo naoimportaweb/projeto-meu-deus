@@ -840,7 +840,8 @@ SQL
 // Mail Masta 1.0 — CVE-2016-10956 (LFI). Arquivo vulneravel do plugin, reproduzido p/ o lab.
 include($_GET['pl']);
 PHP
-  if curl -fsSL "https://downloads.wordpress.org/plugin/wp-file-manager.6.0.zip" -o /tmp/wpp.zip 2>/dev/null; then
+  # componente vulneravel espelhado no nosso repo publico (wordpress.org remove versoes antigas)
+  if curl -fsSL "https://raw.githubusercontent.com/naoimportaweb/projeto-meu-deus/main/assets/wordpress/wp-file-manager.6.0.zip" -o /tmp/wpp.zip 2>/dev/null; then
     unzip -oq /tmp/wpp.zip -d "$W/wp-content/plugins" 2>/dev/null || warn "wordpress: wp-file-manager unzip falhou"
     # O wordpress.org nao serve mais a versao vulneravel 6.0 direto: o .6.0.zip vem
     # com um zip ANINHADO (wp-file-manager/wp-file-manager-6.O.zip) que contem o plugin
