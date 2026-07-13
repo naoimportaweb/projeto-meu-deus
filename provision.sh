@@ -842,7 +842,16 @@ include($_GET['pl']);
 PHP
   if curl -fsSL "https://downloads.wordpress.org/plugin/wp-file-manager.6.0.zip" -o /tmp/wpp.zip 2>/dev/null; then
     unzip -oq /tmp/wpp.zip -d "$W/wp-content/plugins" 2>/dev/null || warn "wordpress: wp-file-manager unzip falhou"
+    # O wordpress.org nao serve mais a versao vulneravel 6.0 direto: o .6.0.zip vem
+    # com um zip ANINHADO (wp-file-manager/wp-file-manager-6.O.zip) que contem o plugin
+    # real (elFinder/connector.minimal.php da CVE-2020-25213). Extraia o interno.
+    local inner; inner="$(find "$W/wp-content/plugins/wp-file-manager" -maxdepth 1 -iname '*.zip' 2>/dev/null | head -1)"
+    if [ -n "$inner" ]; then
+      unzip -oq "$inner" -d "$W/wp-content/plugins" 2>/dev/null || warn "wordpress: wp-file-manager (zip interno) unzip falhou"
+      rm -f "$inner"
+    fi
     rm -f /tmp/wpp.zip
+    [ -f "$W/wp-content/plugins/wp-file-manager/readme.txt" ] || warn "wordpress: wp-file-manager sem readme.txt — verifique o unzip aninhado"
   else warn "wordpress: wp-file-manager download falhou"; fi
   chown -R www-data:www-data "$W/wp-content/plugins"
   # flag lida via RCE (www-data), fora do docroot
