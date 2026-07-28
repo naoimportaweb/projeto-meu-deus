@@ -510,14 +510,19 @@ zone "empresa.local" {
     allow-transfer { any; };
 };
 EOF
+  # ns1/www resolvem para o IP alcancavel DESTA VM (nao 127.0.0.1): senao dnsrecon/
+  # dnsenum/fierce mandam o AXFR para localhost e voltam vazios (eles resolvem o NS
+  # pelo resolvedor do sistema). O dig axfr @<ip> funciona nos dois casos. Ver cap 4.
+  local LAB_IP; LAB_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$LAB_IP" ] || LAB_IP="127.0.0.1"
   cat > /etc/bind/db.empresa.local <<EOF
 \$TTL 604800
 @   IN  SOA ns1.empresa.local. admin.empresa.local. (
-        2024010101 604800 86400 2419200 604800 )
+        $(date +%Y%m%d%H) 604800 86400 2419200 604800 )
 @       IN  NS      ns1.empresa.local.
 @       IN  MX  10  mail.empresa.local.
-ns1     IN  A       127.0.0.1
-www     IN  A       127.0.0.1
+ns1     IN  A       ${LAB_IP}
+www     IN  A       ${LAB_IP}
 mail    IN  A       10.0.0.3
 intranet IN A       10.0.0.5
 vpn     IN  A       10.0.0.6
