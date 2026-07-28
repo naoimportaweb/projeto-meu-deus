@@ -467,6 +467,7 @@ mod_nfs() {
   chmod -R 0777 /srv/nfs
   echo '/srv/nfs *(rw,sync,no_root_squash,no_subtree_check,insecure)' > /etc/exports
   modprobe nfsd 2>/dev/null || true          # garante o módulo do kernel
+  systemctl unmask rpcbind rpcbind.socket nfs-server 2>/dev/null || true  # Qubes deixa rpcbind masked
   svc rpcbind                                 # rpcbind PRIMEIRO (nfs depende dele)
   svc nfs-kernel-server
   exportfs -ra 2>/dev/null || true            # exporta depois do servidor no ar
@@ -788,6 +789,9 @@ mod_tomcat() {
   info "== tomcat: manager com creds fracas (deploy WAR = RCE) =="
   apt_install tomcat10 tomcat10-admin
   sed -i 's/port="8080"/port="8082"/' /etc/tomcat10/server.xml 2>/dev/null || true
+  # bind no IP externo da VM: em Qubes o qubes-updates-proxy ja ocupa 127.0.0.1:8082 e colidiria com 0.0.0.0
+  TC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [ -n "$TC_IP" ] && sed -i "s#port=\"8082\" protocol=\"HTTP/1.1\"#port=\"8082\" address=\"$TC_IP\" protocol=\"HTTP/1.1\"#" /etc/tomcat10/server.xml 2>/dev/null || true
   cat > /etc/tomcat10/tomcat-users.xml <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
 <tomcat-users xmlns="http://tomcat.apache.org/xml">
@@ -805,6 +809,9 @@ XML
   done
   mkdir -p /var/lib/tomcat10/webapps/ROOT
   printf '%s\n' "$FLAG_TOMCAT" > /var/lib/tomcat10/webapps/ROOT/flag.txt 2>/dev/null || true
+  # deploy do Manager/Host-Manager (o tomcat10-admin nao cria os symlinks sozinho -> 404)
+  ln -sfn /usr/share/tomcat10-admin/manager /var/lib/tomcat10/webapps/manager
+  ln -sfn /usr/share/tomcat10-admin/host-manager /var/lib/tomcat10/webapps/host-manager
   svc tomcat10
 }
 
