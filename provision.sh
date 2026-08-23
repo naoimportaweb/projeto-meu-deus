@@ -354,6 +354,12 @@ mod_samba() {
    read only = yes
 EOF
   fi
+  # SMB1/NT1 habilitado (propositalmente inseguro): os scripts nmap smb-* (smb-os-discovery,
+  # smb-security-mode, smb-enum-shares, smb-enum-users) negociam SMBv1; sem NT1 o Samba moderno
+  # recusa e o nmap não devolve Host script results. É o vetor de recon do capítulo 6 do Kalika.
+  if ! grep -qE '^\s*server min protocol\s*=\s*NT1' /etc/samba/smb.conf; then
+    sed -i '/^\[global\]/a\   server min protocol = NT1\n   client min protocol = NT1\n   ntlm auth = yes' /etc/samba/smb.conf
+  fi
   mkdir -p /srv/samba/publico /srv/samba/privado
   echo "Dica: a app web esta na porta 80; o FTP na 21." > /srv/samba/publico/notas.txt
   echo "Credenciais do banco: webapp / webapp123" > /srv/samba/privado/segredo.txt
