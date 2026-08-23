@@ -15,6 +15,7 @@
 #   sudo ./provision.sh --all           # instala tudo (sem menu)
 #   sudo ./provision.sh --only dns,web  # instala só esses módulos
 #   sudo ./provision.sh --list          # lista os módulos disponíveis
+#   sudo ./provision.sh --reip          # re-detecta o IP e reassocia dns/tomcat/wordpress
 #   sudo ./provision.sh --all --yes     # tudo, sem pedir confirmação
 #
 set -euo pipefail
@@ -59,6 +60,59 @@ apt_try() {
   DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@"
 }
 
+# IP alcancavel desta VM (1a coluna do hostname -I). Fonte unica p/ os modulos que
+# gravam o IP em disco (dns, tomcat, wordpress) e p/ o --reip.
+lab_ip() { hostname -I 2>/dev/null | awk '{print $1}'; }
+
+# --reip: reassocia ao IP ATUAL os servicos que gravaram o IP no provision (a VM
+# trocou de rede depois — ex.: snapshot/DHCP entre turmas). Nao regenera flags,
+# nao usa internet: so reescreve os 3 pontos com IP fixo e reinicia os servicos.
+do_reip() {
+  local IP; IP="$(lab_ip)"
+  [ -n "$IP" ] || die "reip: nao consegui detectar o IP (hostname -I vazio)"
+  info "== reip: reassociando servicos ao IP atual ($IP) =="
+  local touched=0
+
+  # 1) DNS: ns1/www resolvem para o IP desta VM (AXFR realista)
+  local Z=/etc/bind/db.empresa.local
+  if [ -f "$Z" ]; then
+    sed -i -E "s|^(ns1[[:space:]]+IN[[:space:]]+A[[:space:]]+).*|\1${IP}|; \
+               s|^(www[[:space:]]+IN[[:space:]]+A[[:space:]]+).*|\1${IP}|" "$Z"
+    # sobe o serial do SOA (10 digitos) p/ propagar a mudanca
+    sed -i -E "s/[0-9]{10}( 604800 86400)/$(date +%Y%m%d%H)\1/" "$Z"
+    if named-checkzone empresa.local "$Z" >/dev/null 2>&1; then
+      if systemctl list-unit-files 2>/dev/null | grep -q '^named'; then svc named; else svc bind9; fi
+      log "dns: ns1/www -> $IP"; touched=1
+    else warn "dns: named-checkzone reclamou — zona NAO recarregada"; fi
+  fi
+
+  # 2) Tomcat: connector 8082 precisa bindar no IP externo (nao no antigo)
+  local TX=/etc/tomcat10/server.xml
+  if [ -f "$TX" ]; then
+    # nas linhas do connector 8082: troca o address existente OU insere se faltar
+    sed -i -E '/port="8082"/{ s/address="[^"]*"/address="'"$IP"'"/; t; s#port="8082"#port="8082" address="'"$IP"'"#; }' "$TX"
+    svc tomcat10; log "tomcat: connector 8082 -> address=$IP"; touched=1
+  fi
+
+  # 3) WordPress: siteurl/home + refs no banco
+  local W=/var/www/html/wordpress
+  if [ -d "$W" ] && command -v wp >/dev/null 2>&1; then
+    local WPC="sudo -u www-data wp --path=$W"
+    local cur oldhost
+    cur="$($WPC option get siteurl 2>/dev/null || true)"
+    oldhost="$(printf '%s' "$cur" | sed -E 's#https?://([^/]+).*#\1#')"
+    $WPC option update siteurl "http://${IP}/wordpress" >/dev/null 2>&1 || true
+    $WPC option update home    "http://${IP}/wordpress" >/dev/null 2>&1 || true
+    if [ -n "$oldhost" ] && [ "$oldhost" != "$IP" ]; then
+      $WPC search-replace "//$oldhost" "//$IP" --all-tables --report-changed-only >/dev/null 2>&1 || true
+    fi
+    log "wordpress: siteurl/home -> http://${IP}/wordpress"; touched=1
+  fi
+
+  [ "$touched" = 1 ] || warn "reip: nenhum modulo com IP fixo instalado (dns/tomcat/wordpress)"
+  log "reip concluido."
+}
+
 # ---------------------------------------------------------- registro de módulos
 MODS=(base ssh ftp vsftpd234 ftpdos samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress phpmyadmin privesc)
 declare -A TITLE
@@ -85,13 +139,13 @@ TITLE[phpmyadmin]="phpMyAdmin exposto (usa as creds do mysql)"
 TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
 
 usage() {
-  echo "Uso: sudo ./provision.sh [--all | --only m1,m2,...] [--yes] [--list]"
+  echo "Uso: sudo ./provision.sh [--all | --only m1,m2,...] [--yes] [--list] [--reip]"
   echo "Módulos:"; for m in "${MODS[@]}"; do printf "  %-9s %s\n" "$m" "${TITLE[$m]}"; done
 }
 
 # --------------------------------------------------------------- args + seleção
 declare -A SEL; for m in "${MODS[@]}"; do SEL[$m]=0; done
-INTERACTIVE=1; ASSUME_YES=0
+INTERACTIVE=1; ASSUME_YES=0; REIP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --all)  INTERACTIVE=0; for m in "${MODS[@]}"; do SEL[$m]=1; done;;
@@ -101,6 +155,7 @@ while [ $# -gt 0 ]; do
               SEL[$p]=1
             done;;
     --yes)  ASSUME_YES=1;;
+    --reip) REIP=1;;
     --list) usage; exit 0;;
     -h|--help) usage; exit 0;;
     *) die "opção desconhecida: '$1' (veja --help)";;
@@ -109,6 +164,7 @@ done
 
 # ------------------------------------------------------------------- guardas --
 [ "$(id -u)" -eq 0 ] || die "rode como root:  sudo ./provision.sh"
+if [ "$REIP" = 1 ]; then do_reip; exit 0; fi
 command -v apt-get >/dev/null 2>&1 || die "feito para Debian/Ubuntu (apt-get ausente)"
 case "$(hostname 2>/dev/null)" in *prod*|*production*) die "hostname parece produção — abortando";; esac
 
@@ -520,7 +576,7 @@ EOF
   # ns1/www resolvem para o IP alcancavel DESTA VM (nao 127.0.0.1): senao dnsrecon/
   # dnsenum/fierce mandam o AXFR para localhost e voltam vazios (eles resolvem o NS
   # pelo resolvedor do sistema). O dig axfr @<ip> funciona nos dois casos. Ver cap 4.
-  local LAB_IP; LAB_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  local LAB_IP; LAB_IP="$(lab_ip)"
   [ -n "$LAB_IP" ] || LAB_IP="127.0.0.1"
   cat > /etc/bind/db.empresa.local <<EOF
 \$TTL 604800
@@ -796,7 +852,7 @@ mod_tomcat() {
   apt_install tomcat10 tomcat10-admin
   sed -i 's/port="8080"/port="8082"/' /etc/tomcat10/server.xml 2>/dev/null || true
   # bind no IP externo da VM: em Qubes o qubes-updates-proxy ja ocupa 127.0.0.1:8082 e colidiria com 0.0.0.0
-  TC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  TC_IP="$(lab_ip)"
   [ -n "$TC_IP" ] && sed -i "s#port=\"8082\" protocol=\"HTTP/1.1\"#port=\"8082\" address=\"$TC_IP\" protocol=\"HTTP/1.1\"#" /etc/tomcat10/server.xml 2>/dev/null || true
   cat > /etc/tomcat10/tomcat-users.xml <<'XML'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -837,7 +893,7 @@ CREATE USER IF NOT EXISTS 'wpuser'@'localhost' IDENTIFIED BY 'wppass';
 GRANT ALL ON wordpress.* TO 'wpuser'@'localhost'; FLUSH PRIVILEGES;
 SQL
   mkdir -p "$W"; chown -R www-data:www-data "$W"
-  local IPADDR; IPADDR="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  local IPADDR; IPADDR="$(lab_ip)"
   local WPC="sudo -u www-data wp --path=$W"
   $WPC core download --force 2>/dev/null || { warn "wordpress: core download falhou — abortado"; return; }
   $WPC config create --dbname=wordpress --dbuser=wpuser --dbpass=wppass --dbhost=127.0.0.1 --force 2>/dev/null
