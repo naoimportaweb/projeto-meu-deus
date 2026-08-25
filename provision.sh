@@ -545,6 +545,11 @@ mod_smtp() {
   apt_install postfix
   postconf -e 'inet_interfaces = all'
   postconf -e 'inet_protocols = ipv4'
+  # o banner/HELO usam $myhostname; sem isto o Postfix anuncia "debian" e não
+  # "empresa.local" (o mailname do debconf não vai para o banner) — o cap 07 do
+  # Kalika depende do domínio empresa.local no banner e nos e-mails forjados.
+  postconf -e 'myhostname = empresa.local'
+  postconf -e 'mydomain = empresa.local'
   postconf -e 'mynetworks = 0.0.0.0/0'
   postconf -e 'smtpd_recipient_restrictions = permit'
   postconf -e 'smtpd_helo_required = no'
