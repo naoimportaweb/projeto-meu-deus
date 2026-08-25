@@ -236,6 +236,12 @@ log "Provisionando: ${CHOSEN[*]}"
 # ============================================================ MÓDULOS
 mod_base() {
   info "== base: usuários e credenciais fracas =="
+  # o livro (caps 03, 08, ...) assume o hostname "exploitable" nos prompts, no
+  # sysDescr/sysName do SNMP e nas saídas de shell; a instalação Debian padrão
+  # fica "debian". Fixa o hostname (o guard de produção já rodou lá em cima).
+  hostnamectl set-hostname exploitable 2>/dev/null || echo exploitable > /etc/hostname
+  sed -i 's/\b\(debian\|localhost\.localdomain\)\b/exploitable/g' /etc/hosts 2>/dev/null || true
+  grep -q exploitable /etc/hosts || echo "127.0.1.1 exploitable" >> /etc/hosts
   add_user msfadmin msfadmin
   add_user aluno    aluno
   add_user servico  servico123
@@ -808,10 +814,21 @@ mod_snmp() {
 agentAddress udp:161
 rocommunity public
 rwcommunity private
+sysName exploitable
 sysLocation Sala de servidores - ${FLAG_SNMP}
 sysContact admin@empresa.local
 extend whoami /usr/bin/id
 EOF
+  # snmpd do Debian larga privilegio p/ Debian-snmp por padrao (-u/-g no ExecStart);
+  # o cap 08 do Kalika ensina "snmpd como root -> RCE via extend" (extend whoami = id
+  # deve mostrar uid=0). Drop-in que remove o -u/-g e roda o snmpd como root.
+  mkdir -p /etc/systemd/system/snmpd.service.d
+  cat > /etc/systemd/system/snmpd.service.d/override.conf <<'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/snmpd -LOw -I -smux,mteTrigger,mteTriggerConf -f
+EOF
+  systemctl daemon-reload 2>/dev/null || true
   svc snmpd
 }
 
