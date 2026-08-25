@@ -421,8 +421,11 @@ EOF
   echo "Credenciais do banco: webapp / webapp123" > /srv/samba/privado/segredo.txt
   chmod -R 0777 /srv/samba/publico
   chmod -R 0770 /srv/samba/privado
-  # define a senha samba de msfadmin (se o usuário existir)
+  # define a senha samba de msfadmin (se o usuário existir) e o torna dono do share
+  # [privado] (o dir/segredo.txt nascem root:root 0770; sem chown, valid users=msfadmin
+  # ainda bate em ACCESS_DENIED no filesystem — msfadmin cai em "other" = sem permissão)
   if id msfadmin >/dev/null 2>&1; then
+    chown -R msfadmin:msfadmin /srv/samba/privado
     (echo 'msfadmin'; echo 'msfadmin') | smbpasswd -s -a msfadmin >/dev/null 2>&1 || true
   fi
   # usuario de servico p/ enumeracao RPC/SAMR (null session) + share [backup] com flag
