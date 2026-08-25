@@ -618,6 +618,11 @@ EOF
 mod_web() {
   info "== web: Apache + PHP + MariaDB vulnerável =="
   apt_install apache2 php libapache2-mod-php php-mysql mariadb-server
+  # expose_php On -> Apache manda "X-Powered-By: PHP/x.y" (fingerprint do cap 09);
+  # o PHP do Debian vem com Off. Liga em todos os php.ini do apache disponiveis.
+  for ini in /etc/php/*/apache2/php.ini; do
+    [ -f "$ini" ] && sed -i 's/^expose_php = Off/expose_php = On/' "$ini"
+  done
   local W=/var/www/html
   rm -f "$W/index.html"; mkdir -p "$W/uploads"
 
